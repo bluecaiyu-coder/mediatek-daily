@@ -1,0 +1,42 @@
+name: mediatek-daily
+
+on:
+  schedule:
+    # GitHub cron 使用 UTC：12:00 UTC = 台北 20:00，週一至週五
+    - cron: "0 12 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "一次回補幾天的三大法人資料(首次建議 250)"
+        default: "0"
+
+permissions:
+  contents: write
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run daily report
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python mediatek_daily.py --backfill "${{ github.event.inputs.backfill || '0' }}"
+
+      - name: Commit reports and caches
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add reports data
+          git diff --cached --quiet || git commit -m "daily report $(TZ=Asia/Taipei date +%F)"
+          git push
