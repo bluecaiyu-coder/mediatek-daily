@@ -342,11 +342,18 @@ def main():
 
     # 法人籌碼：快取累積，量夠才進模型
     cache = update_inst_cache(list(f.index), args.backfill)
-    inst = cache.reindex(f.index) / 1000.0  # 股 -> 張
+    inst_all = cache.astype(float) / 1000.0  # 股 -> 張
+    roll = inst_all.rolling(5).sum()          # 以快取自身日期計算，不受最新一天尚未公布影響
     for k in ("foreign", "trust", "dealer"):
-        f[f"{k}_5d"] = inst[k].rolling(5).sum()
+        f[f"{k}_5d"] = roll[k].reindex(f.index)
     inst_cols = ["foreign_5d", "trust_5d", "dealer_5d"]
     use_inst = f[inst_cols[0]].notna().sum() >= MIN_INST_ROWS
+    # 即時預測列：最新一天法人資料若尚未公布，沿用最近一個可得值
+    for col in inst_cols:
+        if pd.isna(f[col].iloc[-1]):
+            rs = roll[col.replace("_5d", "")].dropna()
+            if len(rs):
+                f.loc[f.index[-1], col] = rs.iloc[-1]
 
     base_cols = [x for x in f.columns if x not in ("nxt", *inst_cols)]
     feat_cols = base_cols + (inst_cols if use_inst else [])
@@ -383,18 +390,23 @@ def main():
     def add(grp, name, val, score, src):
         F.append((len(F) + 1, grp, name, val, score, src))
 
-    def inst_score(col, raw):
+    def inst_score(v, raw):
         s = raw.dropna()
-        if len(s) < 20 or pd.isna(last[col]):
+        if len(s) < 20 or pd.isna(v):
             return None
         scale = s.abs().mean() * 5
-        return clip_int(last[col] / scale * 2) if scale else None
+        return clip_int(v / scale * 2) if scale else None
 
     for key, nm in (("foreign", "外資"), ("trust", "投信"), ("dealer", "自營商")):
-        v = last[f"{key}_5d"]
-        add("籌碼", f"{nm}近5日買賣超(聯發科)",
-            "n/a" if pd.isna(v) else f"{v:,.0f} 張",
-            inst_score(f"{key}_5d", inst[key]), "TWSE" + ("/模型" if use_inst else "/累積中"))
+        rs = roll[key].dropna()
+        v = rs.iloc[-1] if len(rs) else float("nan")
+        txt = "n/a"
+        if len(rs):
+            txt = f"{v:,.0f} 張"
+            if rs.index[-1] < asof:
+                txt += f"（資料至 {rs.index[-1]:%m/%d}）"
+        add("籌碼", f"{nm}近5日買賣超(聯發科)", txt,
+            inst_score(v, inst_all[key]), "FinMind" + ("/模型" if use_inst else "/累積中"))
     add("籌碼", "外資持股比例變化", "未自動化", None, "待擴充")
     add("籌碼", "融資融券餘額變化", "未自動化", None, "待擴充")
     vr = last["vol_ratio"]
