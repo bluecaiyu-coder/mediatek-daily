@@ -138,6 +138,7 @@ def fetch_t86(d):
                              "response": "json"}, headers=UA, timeout=30)
     j = r.json()
     if j.get("stat") != "OK":
+        print(f"[warn] TWSE T86 {d.date()} stat={j.get('stat')!r}")
         return None
     fl = j["fields"]
     i_f = _find(fl, "外陸資買賣超股數(不含外資自營商)", ("外", "買賣超"))
@@ -147,7 +148,32 @@ def fetch_t86(d):
         if row[0].strip() == CODE:
             return {"foreign": _num(row[i_f]), "trust": _num(row[i_t]),
                     "dealer": _num(row[i_d])}
+    print(f"[warn] TWSE T86 {d.date()} 找不到代號 {CODE}")
     return None
+
+
+def fetch_finmind(start):
+    """FinMind 公開 API：一次取得個股三大法人買賣超(單位：股)。"""
+    r = requests.get("https://api.finmindtrade.com/api/v4/data",
+                     params={"dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+                             "data_id": CODE, "start_date": start},
+                     headers=UA, timeout=60)
+    j = r.json()
+    if j.get("status") != 200 or not j.get("data"):
+        print(f"[warn] FinMind status={j.get('status')} msg={j.get('msg')}")
+        return None
+    df = pd.DataFrame(j["data"])
+    df["net"] = df["buy"] - df["sell"]
+    m = {"Foreign_Investor": "foreign", "Investment_Trust": "trust",
+         "Dealer_self": "dealer", "Dealer_Hedging": "dealer"}
+    df["k"] = df["name"].map(m)
+    df = df.dropna(subset=["k"])
+    if df.empty:
+        print(f"[warn] FinMind 名稱未對應，實際名稱：{sorted(set(j['data'][0:1] and [x['name'] for x in j['data']]))}")
+        return None
+    out = df.pivot_table(index="date", columns="k", values="net", aggfunc="sum")
+    out.index = pd.to_datetime(out.index)
+    return out.reindex(columns=["foreign", "trust", "dealer"])
 
 
 def update_inst_cache(trading_dates, backfill):
@@ -155,21 +181,38 @@ def update_inst_cache(trading_dates, backfill):
     cache = (pd.read_csv(path, index_col=0, parse_dates=True)
              if os.path.exists(path) else
              pd.DataFrame(columns=["foreign", "trust", "dealer"]))
-    lookback = max(60, backfill)
+    cache.index = pd.to_datetime(cache.index)
+    lookback = max(60, backfill, 300 if len(cache) < MIN_INST_ROWS else 0)
     want = [d for d in trading_dates[-lookback:] if d not in cache.index]
-    limit = max(20, backfill)
-    for d in list(reversed(want))[:limit]:
+    if want:
+        fm = None
         try:
-            row = fetch_t86(d)
-        except Exception as e:  # 網路/封鎖/格式變動都不讓整支腳本失敗
-            print(f"[warn] T86 {d.date()} 失敗: {e}")
-            break
-        if row:
-            cache.loc[d] = row
-        time.sleep(3)  # TWSE 有頻率限制
+            fm = fetch_finmind(min(want).strftime("%Y-%m-%d"))
+        except Exception as e:
+            print(f"[warn] FinMind 失敗: {e}")
+        if fm is not None:
+            cache = pd.concat([cache, fm[~fm.index.isin(cache.index)]])
+            print(f"[info] FinMind 取得 {len(fm)} 天法人資料")
+        else:  # 備援：證交所逐日抓，連續失敗 3 次就放棄
+            fails = 0
+            for d in list(reversed(want))[:20]:
+                try:
+                    row = fetch_t86(d)
+                except Exception as e:
+                    print(f"[warn] T86 {d.date()} 例外: {e}")
+                    row = None
+                if row:
+                    cache.loc[d] = row
+                    fails = 0
+                else:
+                    fails += 1
+                    if fails >= 3:
+                        break
+                time.sleep(3)
     cache = cache.sort_index()
     cache.index.name = "date"
     cache.to_csv(path)
+    print(f"[info] 法人快取共 {len(cache)} 天")
     return cache
 
 
