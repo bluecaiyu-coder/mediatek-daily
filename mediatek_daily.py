@@ -410,16 +410,23 @@ def main():
                 f.loc[f.index[-1], col] = rs.iloc[-1]
 
     # 外資持股比例、融資融券
-    chip = update_chip_extra(asof)
+    try:
+        chip = update_chip_extra(asof)
+    except Exception as e:  # 新增因子失敗時不拖垮整支腳本
+        print(f"[warn] 籌碼補充資料失敗，略過: {e}")
+        chip = pd.DataFrame(columns=["foreign_ratio", "margin_bal", "short_bal"],
+                            index=pd.DatetimeIndex([])).astype(float)
     f["foreign_ratio_chg5"] = (chip["foreign_ratio"] - chip["foreign_ratio"].shift(5)).reindex(f.index)
     f["margin_chg5"] = chip["margin_bal"].pct_change(5, fill_method=None).reindex(f.index)
     f["short_chg5"] = chip["short_bal"].pct_change(5, fill_method=None).reindex(f.index)
+    f = f.replace([np.inf, -np.inf], np.nan)  # 餘額為 0 會產生無限大，模型會報錯
     extra_cols = ["foreign_ratio_chg5", "margin_chg5", "short_chg5"]
     use_extra = all(f[c_].notna().sum() >= MIN_INST_ROWS for c_ in extra_cols)
     chip_chg = pd.DataFrame({
         "foreign_ratio_chg5": chip["foreign_ratio"] - chip["foreign_ratio"].shift(5),
         "margin_chg5": chip["margin_bal"].pct_change(5, fill_method=None),
         "short_chg5": chip["short_bal"].pct_change(5, fill_method=None)})
+    chip_chg = chip_chg.replace([np.inf, -np.inf], np.nan)
     for col in extra_cols:  # 最新一天尚未公布時，即時預測列沿用最近可得值
         if pd.isna(f[col].iloc[-1]):
             rs = chip_chg[col].dropna()
