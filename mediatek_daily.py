@@ -120,6 +120,12 @@ def align_level(series, idx, cutoffs):
     return pd.Series(m["v"].values, index=idx)
 
 
+def _session(ts):
+    e = ts.tz_convert("America/New_York")
+    lm = e.hour * 60 + e.minute
+    return "盤中" if 570 <= lm < 960 else "盤前" if 240 <= lm < 570 else "盤後" if 960 <= lm < 1200 else "休市"
+
+
 def fetch_afterhours(tk):
     """美股正規盤收盤價與最新盤後(含盤前)價，來源 yfinance 1 分鐘資料(prepost)。"""
     h = yf.Ticker(tk).history(period="5d", interval="1m", prepost=True)
@@ -133,7 +139,7 @@ def fetch_afterhours(tk):
     reg_close, last_px = float(reg["Close"].iloc[-1]), float(h["Close"].iloc[-1])
     return {"reg_close": reg_close, "last": last_px, "move": last_px / reg_close - 1,
             "reg_date": reg.index[-1].tz_convert("America/New_York").date(),
-            "ts": h.index[-1].tz_convert(TZ_TW)}
+            "ts": h.index[-1].tz_convert(TZ_TW), "session": _session(h.index[-1])}
 
 
 # ----------------------------- 資料下載 -----------------------------
@@ -415,6 +421,7 @@ FEAT_ZH = dict(x.split("=") for x in (
     "foreign_ratio_chg5=外資持股比例變化;margin_chg5=融資餘額變化;short_chg5=融券餘額變化").split(";"))
 MODEL_DRIVERS = {}
 SCEN = {}
+LIVE_QUOTES = []
 RUN = {"mode": "scheduled", "label": "排程模式"}
 
 
@@ -563,6 +570,15 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
             gl.append(f'<li><span class="bd">{lab}</span> <a href="{_e(l_)}" target="_blank" rel="noopener">{_e(t_)}</a> <span class="sub">{_e(d_)}</span></li>')
     gcard = ('<div class="card"><h2>Google / TPU 動態新聞</h2><ul style="padding-left:18px;margin:0;line-height:1.9">'
              + "".join(gl) + "</ul></div>") if gl else ""
+    lcard = ""
+    if LIVE_QUOTES:
+        lr_ = "".join(
+            f'<tr><td>{_e(q["name"])} <span class="sub">{_e(q["tk"])}</span></td><td>{q["reg_close"]:.2f}</td>'
+            f'<td>{q["last"]:.2f}</td><td class="{"up" if q["move"] >= 0 else "down"}">{q["move"] * 100:+.2f}%</td>'
+            f'<td>{_e(q["session"])}</td><td class="sub">{q["ts"]:%m/%d %H:%M}</td></tr>' for q in LIVE_QUOTES)
+        lcard = ('<div class="card"><h2>即時行情（僅顯示，不影響預測模型）</h2><div class="tw"><table><tr><th>標的</th>'
+                 '<th>正規盤收盤</th><th>最新價</th><th>漲跌</th><th>時段</th><th>時間（台北）</th></tr>' + lr_
+                 + '</table></div><p class="note">資料來自 yfinance，可能延遲或缺漏；這些數字不會被餵進預測模型。</p></div>')
     scard = ""
     if SCEN:
         t_ = lambda n, k: f'<div class="stat"><small>{n}</small><b class="{k}">{SCEN["px"][{"up": 2, "flat": 1, "down": 0}[k]]:.1f}</b><small>{SCEN["rets"][{"up": 2, "flat": 1, "down": 0}[k]] * 100:+.2f}%</small></div>'
@@ -577,7 +593,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
                  + ch(MODEL_DRIVERS["up"], "s1") + '<div class="sub" style="margin-top:6px">壓低上漲機率</div>'
                  + ch(MODEL_DRIVERS["down"], "m1")
                  + '<p class="note">數值為對「上漲 vs 下跌」對數勝算的貢獻；與上方規則化分數無關，兩者可能不一致。</p></div>')
-    banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else ('<div class="warn">即時模式：已納入最新盤後價與盤中資料，可能重複計入台股已反映的行情，僅供感受方向；不列入實盤命中率追蹤。</div>' if RUN["mode"] == "live" else "")
+    banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else ('<div class="warn">即時模式：下方「即時行情」僅供顯示，預測模型與排程版採同一套規則、不受即時資料影響；本次結果不列入實盤命中率追蹤。</div>' if RUN["mode"] == "live" else "")
     return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>聯發科 2454 每日預測</title><style>{CSS}</style></head><body><div class="wrap">
 <div class="top"><div><h1>聯發科 2454 · 每日預測儀表板</h1><div class="sub">資料日 {asof:%Y-%m-%d} ｜ 更新 {_e(now)}（台北）｜ 紅漲綠跌 ｜ {_e(RUN["label"])} ｜ <a href="index.html">排程版</a> · <a href="live.html">即時版</a></div></div>
@@ -586,7 +602,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
 <div class="card"><h2>因子綜合評價（加權平均）</h2><div class="big">{composite:+.1f}</div><div class="gauge"><u style="left:{(composite + 10) / 20 * 100:.0f}%"></u></div>
 <div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
 <div class="card"><h2>顯示分數最極端的因子（規則化評價，非模型）</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
-{scard}{mcard}{gcard}{stats}
+{lcard}{scard}{mcard}{gcard}{stats}
 <div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>分數</th><th>來源</th></tr>{"".join(rows)}</table></div>
 <p class="note">分數為 −10（偏空）到 +10（偏多）的規則化評價，綜合分依來源加權（Google 類 1.5、新聞 0.5、其餘 1.0）；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
 {hist}
@@ -620,17 +636,17 @@ def main():
     gd = close["googl"].dropna()
     if not (ah and len(gd) and ah["reg_date"] == gd.index[-1].date()):
         ah = None
-    ah_fresh = bool(ah and (live_mode or ah["ts"] > pd.Timestamp(f.index[-1]).tz_localize(TZ_TW) + pd.Timedelta(hours=13, minutes=30)))
+    ah_fresh = bool(ah and ah["ts"] > pd.Timestamp(f.index[-1]).tz_localize(TZ_TW) + pd.Timedelta(hours=13, minutes=30))
     if ah_fresh:
         f.loc[f.index[-1], "googl_ret"] = (1 + googl_reg) * (1 + ah["move"]) - 1
-    if live_mode:
-        for key_, tk_ in (("qcom", "QCOM"), ("avgo", "AVGO")):
+    if live_mode:  # 即時行情：僅供網頁顯示，完全不進模型
+        for nm_, tk_ in (("Google", "GOOGL"), ("博通", "AVGO"), ("高通", "QCOM")):
             try:
-                a2, g2 = fetch_afterhours(tk_), close[key_].dropna()
-                if a2 and len(g2) and a2["reg_date"] == g2.index[-1].date():
-                    f.loc[f.index[-1], f"{key_}_ret"] = (1 + f[f"{key_}_ret"].iloc[-1]) * (1 + a2["move"]) - 1
+                q_ = fetch_afterhours(tk_)
+                if q_:
+                    LIVE_QUOTES.append({"name": nm_, "tk": tk_, **q_})
             except Exception as e:
-                print(f"[warn] {tk_} 盤後價失敗: {e}")
+                print(f"[warn] {tk_} 即時行情失敗: {e}")
 
     # 法人籌碼：快取累積，量夠才進模型
     cache = update_inst_cache(list(f.index), args.backfill)
@@ -830,6 +846,10 @@ def main():
         da = "n/a" if live_stats["dir_acc"] is None else f"{live_stats['dir_acc']*100:.1f}%"
         L += ["", "## 實盤追蹤(本腳本每日預測 vs 實際)",
               f"- 已驗證 {live_stats['n']} 天；三分類命中 {live_stats['acc']*100:.1f}%；方向命中 {da}(n={live_stats['n_dir']})"]
+    if LIVE_QUOTES:
+        L += ["", "## 即時行情(僅顯示，不影響模型)"] + [
+            f"- {q['name']}({q['tk']})：正規盤收 {q['reg_close']:.2f} → 最新 {q['last']:.2f}"
+            f"（{pc(q['move'])}，{q['session']}，{q['ts']:%m/%d %H:%M} 台北）" for q in LIVE_QUOTES]
     if SCEN:
         sn = SCEN
         L += ["", f"## 參考價位(情境，以目前價位 {sn['base']:.1f} 計)",
