@@ -37,7 +37,7 @@ TW = {"mtk": "2454.TW", "tsmc": "2330.TW", "twii": "^TWII",
       "novatek": "3034.TW", "realtek": "2379.TW"}
 OVERSEAS = {"sp500": "^GSPC", "nasdaq": "^IXIC", "dow": "^DJI", "sox": "^SOX",
             "vix": "^VIX", "wti": "CL=F", "brent": "BZ=F", "dxy": "DX-Y.NYB",
-            "us10y": "^TNX", "usdtwd": "TWD=X", "qcom": "QCOM", "avgo": "AVGO",
+            "us10y": "^TNX", "usdtwd": "TWD=X", "qcom": "QCOM", "avgo": "AVGO", "googl": "GOOGL",
             "nq": "NQ=F"}
 
 NEWS_QUERIES = {
@@ -48,12 +48,21 @@ NEWS_QUERIES = {
     "analyst": "聯發科 外資 目標價 評等",
     "revenue": "聯發科 營收 法說會 財測",
     "demand": "智慧型手機 出貨 AI 邊緣 晶片 需求",
+    "g_tw": ("Google TPU 聯發科", "zh", 7),
+    "g_en": ("Google TPU MediaTek", "en", 7),
+    "g_ai": ("Alphabet Google AI chip TPU capex", "en", 7),
 }
 POS = ["停火", "和談", "談判", "降息", "上修", "調升", "買進", "看好", "創高", "利多",
        "大漲", "突破", "緩和", "達成協議", "優於預期", "強勁", "回溫", "增持", "樂觀"]
 NEG = ["升級", "攻擊", "轟炸", "制裁", "禁令", "管制", "升息", "下修", "調降", "賣出",
        "看壞", "重挫", "大跌", "衝突", "封鎖", "利空", "衰退", "不如預期", "警告", "加徵", "關稅"]
 
+
+POS_EN = ["surge", "beat", "record", "partnership", "win", "deal", "expand", "order", "growth",
+          "boost", "raise", "upgrade", "strong", "launch", "ramp", "demand"]
+NEG_EN = ["delay", "cut", "ban", "probe", "lawsuit", "downgrade", "miss", "slump", "shortage",
+          "cancel", "antitrust", "fall", "weak", "halt", "concern"]
+NEWS_ITEMS = {}
 
 # ----------------------------- 工具函式 -----------------------------
 def pc(x):
@@ -65,7 +74,7 @@ def cls(r):
 
 
 def clip_int(x):
-    return int(np.clip(round(x), -2, 2))
+    return int(np.clip(round(x), -10, 10))
 
 
 def avg(*xs):
@@ -81,7 +90,7 @@ def zs(col, sign=1):
     sd = s.tail(250).std()
     if not sd or pd.isna(sd):
         return None
-    return clip_int(sign * s.iloc[-1] / sd)
+    return clip_int(sign * s.iloc[-1] / sd * 5)
 
 
 def rsi(c, n=14):
@@ -271,17 +280,28 @@ def update_chip_extra(asof):
 
 
 # ----------------------------- 新聞情緒 (粗略) -----------------------------
-def news_score(query):
-    url = "https://news.google.com/rss/search"
-    r = requests.get(url, params={"q": query + " when:2d", "hl": "zh-TW",
-                                  "gl": "TW", "ceid": "TW:zh-Hant"},
-                     headers=UA, timeout=30)
-    items = ET.fromstring(r.content).findall(".//item")[:15]
-    titles = [(it.findtext("title") or "").strip() for it in items]
-    if not titles:
-        return None, []
-    net = [sum(w in t for w in POS) - sum(w in t for w in NEG) for t in titles]
-    return clip_int(np.mean(net) * 2), titles[:3]
+def news_score(query, lang="zh", days=2):
+    from email.utils import parsedate_to_datetime
+    loc = ({"hl": "zh-TW", "gl": "TW", "ceid": "TW:zh-Hant"} if lang == "zh"
+           else {"hl": "en-US", "gl": "US", "ceid": "US:en"})
+    r = requests.get("https://news.google.com/rss/search",
+                     params={"q": f"{query} when:{days}d", **loc}, headers=UA, timeout=30)
+    items = ET.fromstring(r.content).findall(".//item")
+    heat = len(items)  # 新聞熱度：期間內相關報導則數
+    pos, neg = (POS, NEG) if lang == "zh" else (POS_EN, NEG_EN)
+    rows = []
+    for it in items[:30]:
+        t = (it.findtext("title") or "").strip()
+        try:
+            d = parsedate_to_datetime(it.findtext("pubDate")).strftime("%m/%d")
+        except Exception:
+            d = ""
+        rows.append((d, t, (it.findtext("link") or "").strip()))
+    if not rows:
+        return None, [], 0, []
+    net = [sum(w in t.lower() for w in pos) - sum(w in t.lower() for w in neg) for _, t, _ in rows]
+    amp = 0.5 + 0.5 * min(heat, 40) / 40  # 熱度越高，情緒分數放大越多
+    return clip_int(np.mean(net) * 6 * amp), [f"{t}（{d}）" for d, t, _ in rows[:3]], heat, rows[:8]
 
 
 # ----------------------------- 特徵工程 -----------------------------
@@ -310,7 +330,7 @@ def build_features(close, high, low, vol):
         f[f"{key}_ret"] = r.reindex(idx).fillna(0)
     # 海外資料：只用「嚴格早於 t」的最新收盤
     for key in ("sp500", "nasdaq", "dow", "sox", "qcom", "avgo",
-                "wti", "brent", "dxy", "usdtwd"):
+                "wti", "brent", "dxy", "usdtwd", "googl"):
         f[f"{key}_ret"] = align_prior(close[key].dropna().pct_change(), idx)
     f["vix"] = align_prior(close["vix"], idx)
     f["vix_chg"] = align_prior(close["vix"].pct_change(), idx)
@@ -414,6 +434,10 @@ tr.g td{background:var(--bg);font-weight:600;font-size:13px}
 _LBL = {"up": "漲", "flat": "盤", "down": "跌"}
 
 
+def sclass(x):
+    return "s2" if x >= 6 else "s1" if x >= 2 else "s0" if x > -2 else "m1" if x > -6 else "m2"
+
+
 def _e(x):
     return _html.escape(str(x))
 
@@ -430,16 +454,15 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
         f'<div class="row"><b>{n}</b><div class="bar"><span style="width:{q * 100:.0f}%;background:var(--{c_})"></span></div><i>{q * 100:.0f}%</i></div>'
         for n, q, c_ in (("上漲", p[2], "up"), ("盤整", p[1], "flat"), ("下跌", p[0], "down")))
     sc = [x for x in F if x[4] is not None]
-    pos = sorted([x for x in sc if x[4] >= 1], key=lambda x: -x[4])[:4]
-    neg = sorted([x for x in sc if x[4] <= -1], key=lambda x: x[4])[:4]
+    pos = sorted([x for x in sc if x[4] >= 3], key=lambda x: -x[4])[:4]
+    neg = sorted([x for x in sc if x[4] <= -3], key=lambda x: x[4])[:4]
     chips = lambda L, k: "".join(f'<span class="chip {k}">{_e(x[2])} {x[4]:+d}</span>' for x in L) or '<span class="sub">無</span>'
-    sk = {2: "s2", 1: "s1", 0: "s0", -1: "m1", -2: "m2"}
     rows, g = [], None
     for i, grp, n, val, scr, src in F:
         if grp != g:
             g = grp
             rows.append(f'<tr class="g"><td colspan="5">{_e(grp)}</td></tr>')
-        chip = f'<span class="s {sk[scr]}">{scr:+d}</span>' if scr is not None else '<span class="s sn">—</span>'
+        chip = f'<span class="s {sclass(scr)}">{scr:+d}</span>' if scr is not None else '<span class="s sn">—</span>'
         rows.append(f"<tr><td>{i}</td><td>{_e(n)}</td><td>{_e(val)}</td><td>{chip}</td><td><span class='bd'>{_e(src)}</span></td></tr>")
     stats = ""
     if bt:
@@ -468,18 +491,24 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
         if hr:
             hist = ('<div class="card"><h2>近期預測紀錄</h2><div class="tw"><table><tr><th>資料日</th><th>漲 / 盤 / 跌</th><th>預測</th><th>實際</th><th>結果</th></tr>'
                     + "".join(hr) + "</table></div></div>")
+    gl = []
+    for key, lab in (("g_tw", "中文"), ("g_en", "國際"), ("g_ai", "AI晶片")):
+        for d_, t_, l_ in NEWS_ITEMS.get(key, [])[:5]:
+            gl.append(f'<li><span class="bd">{lab}</span> <a href="{_e(l_)}" target="_blank" rel="noopener">{_e(t_)}</a> <span class="sub">{_e(d_)}</span></li>')
+    gcard = ('<div class="card"><h2>Google / TPU 動態新聞</h2><ul style="padding-left:18px;margin:0;line-height:1.9">'
+             + "".join(gl) + "</ul></div>") if gl else ""
     banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else ""
     return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>聯發科 2454 每日預測</title><style>{CSS}</style></head><body><div class="wrap">
 <div class="top"><div><h1>聯發科 2454 · 每日預測儀表板</h1><div class="sub">資料日 {asof:%Y-%m-%d} ｜ 更新 {_e(now)}（台北）｜ 紅漲綠跌</div></div>
 <div style="text-align:right"><div class="big {'up' if chg1 >= 0 else 'down'}">{px:.1f}</div><div class="sub {'up' if chg1 >= 0 else 'down'}">{chg1 * 100:+.2f}%</div></div></div>{banner}
 <div class="grid"><div class="card"><h2>下一交易日預測</h2><div class="big {cl}">傾向{top}</div><div class="sub">信心：{conf}</div>{bars}</div>
-<div class="card"><h2>因子綜合評價（26 項平均）</h2><div class="big">{composite:+.2f}</div><div class="gauge"><u style="left:{(composite + 2) / 4 * 100:.0f}%"></u></div>
-<div class="sub" style="display:flex;justify-content:space-between"><span>−2 偏空</span><span>+2 偏多</span></div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
+<div class="card"><h2>因子綜合評價（加權平均）</h2><div class="big">{composite:+.1f}</div><div class="gauge"><u style="left:{(composite + 10) / 20 * 100:.0f}%"></u></div>
+<div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
 <div class="card"><h2>主要驅動因子</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
-{stats}
-<div class="card"><h2>26 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>分數</th><th>來源</th></tr>{"".join(rows)}</table></div>
-<p class="note">分數為 −2（偏空）到 +2（偏多）的規則化評價；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
+{gcard}{stats}
+<div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>分數</th><th>來源</th></tr>{"".join(rows)}</table></div>
+<p class="note">分數為 −10（偏空）到 +10（偏多）的規則化評價，綜合分依來源加權（Google 類 1.5、新聞 0.5、其餘 1.0）；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
 {hist}
 <p class="note">台北 20:00 時美股當日尚未開盤，美股資料為前一美股日收盤。本頁僅供參考，不構成投資建議。</p></div></body></html>"""
 
@@ -555,10 +584,11 @@ def main():
     news = {}
     for k, q in NEWS_QUERIES.items():
         try:
-            news[k] = news_score(q)
+            news[k] = news_score(*(q if isinstance(q, tuple) else (q,)))
         except Exception as e:
             print(f"[warn] news {k}: {e}")
-            news[k] = (None, [])
+            news[k] = (None, [], 0, [])
+        NEWS_ITEMS[k] = news[k][3]
 
     # nq 夜盤期貨
     nq_ret = close["nq"].dropna().pct_change()
@@ -570,12 +600,13 @@ def main():
     def add(grp, name, val, score, src):
         F.append((len(F) + 1, grp, name, val, score, src))
 
-    def inst_score(v, raw):
-        s = raw.dropna()
-        if len(s) < 20 or pd.isna(v):
+    tot = (roll["foreign"] + roll["trust"] + roll["dealer"]).dropna()
+    S = tot.tail(250).std() if len(tot) >= 30 else float("nan")
+
+    def inst_score(v, raw=None):  # 三者共用同一把尺：張數越大，分數越極端，不會被小額反向買賣抵銷
+        if pd.isna(v) or pd.isna(S) or not S:
             return None
-        scale = s.abs().mean() * 5
-        return clip_int(v / scale * 2) if scale else None
+        return clip_int(v / S * 5)
 
     for key, nm in (("foreign", "外資"), ("trust", "投信"), ("dealer", "自營商")):
         rs = roll[key].dropna()
@@ -587,6 +618,10 @@ def main():
                 txt += f"（資料至 {rs.index[-1]:%m/%d}）"
         add("籌碼", f"{nm}近5日買賣超(聯發科)", txt,
             inst_score(v, inst_all[key]), "FinMind" + ("/模型" if use_inst else "/累積中"))
+    tv = tot.iloc[-1] if len(tot) else float("nan")
+    tx = "n/a" if pd.isna(tv) else f"{tv:,.0f} 張" + (f"（資料至 {tot.index[-1]:%m/%d}）" if tot.index[-1] < asof else "")
+    add("籌碼", "三大法人合計(依張數加總)", tx, inst_score(tv), "FinMind" + ("/模型" if use_inst else "/累積中"))
+
     def lastv(series):
         x = series.dropna()
         return x.iloc[-1] if len(x) else float("nan")
@@ -603,21 +638,21 @@ def main():
         f"融券 {sb:,.0f} 張（5日 {pc(lastv(chip_chg['short_chg5']))}）",
         zs(f["margin_chg5"], -1), src_x)
     vr = last["vol_ratio"]
-    sgn = np.sign(last["ret1"])
     add("籌碼", "成交量/20日均量", f"{vr:.2f}x",
-        int(2 * sgn) if vr > 1.5 else int(sgn) if vr > 1.2 else 0, "模型")
-
-    n_above = sum(last[f"ma{n}_gap"] > 0 for n in (5, 20, 60))
-    add("技術", "相對5/20/60日均線", f"站上 {n_above}/3 條", {3: 2, 2: 1, 1: -1, 0: -2}[n_above], "模型")
+        clip_int(np.sign(last["ret1"]) * max(vr - 1, 0) * 10), "模型")
+    add("技術", "相對5/20/60日均線",
+        f"{sum(last[f'ma{n}_gap'] > 0 for n in (5, 20, 60))}/3 條之上",
+        avg(*[zs(f[f"ma{n}_gap"]) for n in (5, 20, 60)]), "模型")
     r = last["rsi14"]
-    add("技術", "RSI(14)", f"{r:.1f}",
-        2 if r < 30 else -1 if r < 45 else 0 if r < 55 else 1 if r < 70 else -1, "模型")
+    rs_ = (r - 50) / 20 * 5 if 30 <= r <= 70 else (5 - (r - 70) / 30 * 10 if r > 70 else -5 + (30 - r) / 30 * 10)
+    add("技術", "RSI(14)", f"{r:.1f}", clip_int(rs_), "模型")
     add("技術", "KD與MACD", f"K={last['kd_k']:.0f}, MACD柱={last['macd_hist']*100:+.2f}%",
-        (1 if last["kd_diff"] > 0 else -1) + (1 if last["macd_hist"] > 0 else -1), "模型")
+        avg(zs(f["kd_diff"]), zs(f["macd_hist"])), "模型")
     b = last["bb_pos"]
-    add("技術", "布林通道位置", f"{b:+.2f}", -1 if b > 1 else 1 if b > 0.3 else 1 if b < -1 else -1 if b < -0.3 else 0, "模型")
+    bb_ = 5 * b if abs(b) <= 1 else np.sign(b) * 5 - (b - np.sign(b)) * 5
+    add("技術", "布林通道位置", f"{b:+.2f}", clip_int(bb_), "模型")
     rp = last["range_pos"]
-    add("技術", "20日支撐/壓力位置", f"{rp*100:.0f}% (0=低點,100=高點)", -1 if rp > 0.9 else 1 if rp < 0.1 else 0, "模型")
+    add("技術", "20日支撐/壓力位置", f"{rp*100:.0f}% (0=低點,100=高點)", clip_int((0.5 - rp) * 10), "模型")
 
     z4 = [zs(f[f"{k}_ret"]) for k in ("dow", "sp500", "nasdaq", "sox")]
     add("國際", "美股四大指數(前一美股日)",
@@ -635,11 +670,16 @@ def main():
         avg(*[zs(f[f"{k}_ret"]) for k in ("qcom", "avgo", "novatek", "realtek")]), "模型")
 
     def nrow(grp, name, key):
-        sc, t = news[key]
-        add(grp, name, " ｜ ".join(t[:2]) if t else "無資料", sc, "新聞關鍵字(粗略)")
+        sc, t, heat, _ = news[key]
+        txt = (f"熱度 {heat} 則｜" + " ｜ ".join(t[:2])) if t else "無資料"
+        add(grp, name, txt, sc, "新聞關鍵字(粗略)")
 
     nrow("產業", "手機/AI邊緣晶片需求", "demand")
     nrow("產業", "月營收與法說指引", "revenue")
+    add("產業", "Google(GOOGL)股價(前一美股日)", pc(last["googl_ret"]), zs(f["googl_ret"]), "模型")
+    nrow("產業", "Google TPU×聯發科新聞(中文)", "g_tw")
+    nrow("產業", "Google TPU 國際新聞(英文)", "g_en")
+    nrow("產業", "Alphabet AI晶片/資本支出動態", "g_ai")
     add("總經", "國際油價(WTI/布蘭特)", f"{pc(last['wti_ret'])} / {pc(last['brent_ret'])}",
         avg(zs(f["wti_ret"], -1), zs(f["brent_ret"], -1)), "模型")
     nrow("總經", "烏俄戰爭進度", "ukraine")
@@ -648,15 +688,18 @@ def main():
     nrow("總經", "聯準會利率預期", "fed")
     nrow("總經", "外資券商目標價/評等", "analyst")
 
-    scores = [x[4] for x in F if x[4] is not None]
-    composite = float(np.mean(scores)) if scores else 0.0
+    def wt(x):
+        return 1.5 if x[2].startswith(("Google", "Alphabet")) else 0.5 if "新聞" in x[5] else 1.0
+
+    sc_w = [(x[4], wt(x)) for x in F if x[4] is not None]
+    composite = (sum(a * w for a, w in sc_w) / sum(w for _, w in sc_w)) if sc_w else 0.0
 
     # ---- 報告 ----
     now = dt.datetime.now(TZ_TW).strftime("%Y-%m-%d %H:%M")
     L = [f"# 聯發科(2454) 每日日報", f"產生時間：{now} (台北)　資料日：{asof.date()}　收盤：{c.iloc[-1]:.1f}", ""]
     L += ["## 次一交易日預測",
           f"- **上漲 {p[2]*100:.0f}% ／ 盤整 {p[1]*100:.0f}% ／ 下跌 {p[0]*100:.0f}%** → 傾向「{top}」，信心：{conf}",
-          f"- 因子綜合分(26項平均，-2~+2，僅顯示用)：{composite:+.2f}",
+          f"- 因子加權綜合分(-10~+10，僅顯示用)：{composite:+.1f}",
           f"- 模型輸入：{len(feat_cols)} 個特徵" + ("(含法人籌碼)" if use_inst else f"(法人籌碼累積中：{len(cache)}/{MIN_INST_ROWS} 天)"),
           "", "## 樣本外回測(滾動式，不偷看未來)"]
     if bt:
@@ -671,7 +714,7 @@ def main():
         da = "n/a" if live_stats["dir_acc"] is None else f"{live_stats['dir_acc']*100:.1f}%"
         L += ["", "## 實盤追蹤(本腳本每日預測 vs 實際)",
               f"- 已驗證 {live_stats['n']} 天；三分類命中 {live_stats['acc']*100:.1f}%；方向命中 {da}(n={live_stats['n_dir']})"]
-    L += ["", "## 26 項因子", "| # | 類別 | 因子 | 最新值 | 分數(-2~+2) | 來源 |", "|---|---|---|---|---|---|"]
+    L += ["", f"## {len(F)} 項因子", "| # | 類別 | 因子 | 最新值 | 分數(-10~+10) | 來源 |", "|---|---|---|---|---|---|"]
     for i, g, n, v, s, src in F:
         L.append(f"| {i} | {g} | {n} | {str(v).replace('|', '/')} | {'—' if s is None else f'{s:+d}'} | {src} |")
     L += ["", "> 註：「新聞關鍵字」僅對標題做正負詞計數，非真正語意判斷，無歷史資料可回測，未納入模型；"
