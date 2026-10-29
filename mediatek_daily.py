@@ -382,6 +382,108 @@ def update_predictions(c, asof, p):
     return {"n": len(done), "acc": acc, "dir_acc": dir_acc, "n_dir": len(nf)}
 
 
+# ----------------------------- 網頁儀表板 -----------------------------
+import html as _html
+
+CSS = """
+:root{--bg:#f4f6f9;--card:#fff;--ink:#1c2024;--mute:#6b7280;--line:#e5e7eb;--up:#e5484d;--down:#2f9e5b;--flat:#9aa3af}
+@media(prefers-color-scheme:dark){:root{--bg:#0f1115;--card:#171a21;--ink:#e8eaed;--mute:#9aa3af;--line:#262b36;--up:#ff6b6f;--down:#4cc38a;--flat:#6b7280}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 -apple-system,"Segoe UI","Noto Sans TC","PingFang TC","Microsoft JhengHei",sans-serif}
+.wrap{max-width:960px;margin:0 auto;padding:18px 14px 50px}.sub{color:var(--mute);font-size:13px}
+h1{font-size:21px;margin:0}h2{font-size:16px;margin:0 0 12px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:18px;margin-bottom:14px}
+.top{display:flex;flex-wrap:wrap;justify-content:space-between;gap:8px;align-items:flex-end;margin-bottom:14px}
+.grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(280px,1fr))}
+.big{font-size:34px;font-weight:700;line-height:1.2}.up{color:var(--up)}.down{color:var(--down)}.flat{color:var(--flat)}
+.row{display:flex;align-items:center;gap:10px;margin:8px 0}.row b{width:44px;font-weight:600}.row i{width:48px;text-align:right;font-style:normal}
+.bar{flex:1;height:12px;background:var(--line);border-radius:6px;overflow:hidden}.bar span{display:block;height:100%}
+.gauge{position:relative;height:10px;border-radius:5px;margin:14px 6px 6px;background:linear-gradient(90deg,var(--down),var(--line),var(--up))}
+.gauge u{position:absolute;top:-5px;width:6px;height:20px;border-radius:3px;background:var(--ink);transform:translateX(-3px)}
+.chip{display:inline-block;padding:2px 9px;border-radius:99px;font-size:12px;margin:2px 4px 2px 0;font-weight:600}
+.stats{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(150px,1fr))}
+.stat{border:1px solid var(--line);border-radius:10px;padding:10px 12px}.stat small{color:var(--mute);display:block}.stat b{font-size:22px}
+.tw{overflow-x:auto}table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{padding:8px 10px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}th{color:var(--mute);font-weight:500;font-size:12px}
+tr.g td{background:var(--bg);font-weight:600;font-size:13px}
+.s{display:inline-block;min-width:34px;text-align:center;border-radius:8px;padding:1px 6px;font-weight:700}
+.s2{background:rgba(229,72,77,.22);color:var(--up)}.s1{background:rgba(229,72,77,.10);color:var(--up)}.s0,.sn{background:var(--line);color:var(--mute)}
+.m1{background:rgba(47,158,91,.12);color:var(--down)}.m2{background:rgba(47,158,91,.25);color:var(--down)}
+.bd{font-size:11px;border:1px solid var(--line);border-radius:6px;padding:1px 6px;color:var(--mute);white-space:nowrap}
+.note{color:var(--mute);font-size:12.5px;line-height:1.7}.warn{background:rgba(250,176,5,.15);border-radius:10px;padding:8px 12px;margin-bottom:14px;font-size:13px}
+"""
+_LBL = {"up": "漲", "flat": "盤", "down": "跌"}
+
+
+def _e(x):
+    return _html.escape(str(x))
+
+
+def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, window,
+                note, now, hist_path, sample=False):
+    cl = {"上漲": "up", "盤整": "flat", "下跌": "down"}[top]
+    v = list(spark)
+    lo, hi = min(v), max(v)
+    pts = " ".join(f"{i * 316 / (len(v) - 1) + 2:.1f},{66 - (x - lo) / ((hi - lo) or 1) * 58:.1f}" for i, x in enumerate(v))
+    spark_svg = (f'<svg viewBox="0 0 320 70" width="100%" height="70"><polyline fill="none" stroke="var(--{"up" if v[-1] >= v[0] else "down"})" '
+                 f'stroke-width="2" points="{pts}"/></svg>')
+    bars = "".join(
+        f'<div class="row"><b>{n}</b><div class="bar"><span style="width:{q * 100:.0f}%;background:var(--{c_})"></span></div><i>{q * 100:.0f}%</i></div>'
+        for n, q, c_ in (("上漲", p[2], "up"), ("盤整", p[1], "flat"), ("下跌", p[0], "down")))
+    sc = [x for x in F if x[4] is not None]
+    pos = sorted([x for x in sc if x[4] >= 1], key=lambda x: -x[4])[:4]
+    neg = sorted([x for x in sc if x[4] <= -1], key=lambda x: x[4])[:4]
+    chips = lambda L, k: "".join(f'<span class="chip {k}">{_e(x[2])} {x[4]:+d}</span>' for x in L) or '<span class="sub">無</span>'
+    sk = {2: "s2", 1: "s1", 0: "s0", -1: "m1", -2: "m2"}
+    rows, g = [], None
+    for i, grp, n, val, scr, src in F:
+        if grp != g:
+            g = grp
+            rows.append(f'<tr class="g"><td colspan="5">{_e(grp)}</td></tr>')
+        chip = f'<span class="s {sk[scr]}">{scr:+d}</span>' if scr is not None else '<span class="s sn">—</span>'
+        rows.append(f"<tr><td>{i}</td><td>{_e(n)}</td><td>{_e(val)}</td><td>{chip}</td><td><span class='bd'>{_e(src)}</span></td></tr>")
+    stats = ""
+    if bt:
+        ok = bt["acc"] >= .9 or bt["dir_acc"] >= .9
+        stats = (f'<div class="card"><h2>樣本外回測（滾動式，不偷看未來）</h2><div class="stats">'
+                 f'<div class="stat"><small>漲跌方向命中率</small><b>{bt["dir_acc"] * 100:.1f}%</b><small>永遠猜漲：{bt["always_up"] * 100:.1f}%</small></div>'
+                 f'<div class="stat"><small>三分類命中率</small><b>{bt["acc"] * 100:.1f}%</b><small>基準線：{bt["base_acc"] * 100:.1f}%</small></div>'
+                 f'<div class="stat"><small>回測天數</small><b>{bt["n"]}</b><small>訓練視窗 {window} 日</small></div>'
+                 f'<div class="stat"><small>達成 90% 目標</small><b>{"是" if ok else "否"}</b><small>超過 60% 已屬罕見</small></div></div>'
+                 f'<p class="note">只有「高於基準線」才代表模型有價值。回測若出現 90% 以上，應先懷疑資料洩漏或過擬合。</p></div>')
+    if live:
+        da = "n/a" if live["dir_acc"] is None else f'{live["dir_acc"] * 100:.1f}%'
+        stats += (f'<div class="card"><h2>實盤追蹤（本系統每日預測 vs 實際）</h2><div class="stats">'
+                  f'<div class="stat"><small>已驗證天數</small><b>{live["n"]}</b></div>'
+                  f'<div class="stat"><small>方向命中率</small><b>{da}</b><small>n={live["n_dir"]}</small></div>'
+                  f'<div class="stat"><small>三分類命中率</small><b>{live["acc"] * 100:.1f}%</b></div></div></div>')
+    hist = ""
+    if os.path.exists(hist_path):
+        h = pd.read_csv(hist_path, dtype=object).tail(15).iloc[::-1]
+        hr = []
+        for _, r in h.iterrows():
+            act = r["actual"] if isinstance(r["actual"], str) and r["actual"] else None
+            mk = "待驗證" if act is None else ("✓" if act == r["pred"] else "✗")
+            hr.append(f"<tr><td>{_e(r['asof'])}</td><td>{float(r['p_up']) * 100:.0f}% / {float(r['p_flat']) * 100:.0f}% / {float(r['p_down']) * 100:.0f}%</td>"
+                      f"<td>{_LBL.get(r['pred'], '')}</td><td>{_LBL.get(act, '—')}</td><td>{mk}</td></tr>")
+        if hr:
+            hist = ('<div class="card"><h2>近期預測紀錄</h2><div class="tw"><table><tr><th>資料日</th><th>漲 / 盤 / 跌</th><th>預測</th><th>實際</th><th>結果</th></tr>'
+                    + "".join(hr) + "</table></div></div>")
+    banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else ""
+    return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>聯發科 2454 每日預測</title><style>{CSS}</style></head><body><div class="wrap">
+<div class="top"><div><h1>聯發科 2454 · 每日預測儀表板</h1><div class="sub">資料日 {asof:%Y-%m-%d} ｜ 更新 {_e(now)}（台北）｜ 紅漲綠跌</div></div>
+<div style="text-align:right"><div class="big {'up' if chg1 >= 0 else 'down'}">{px:.1f}</div><div class="sub {'up' if chg1 >= 0 else 'down'}">{chg1 * 100:+.2f}%</div></div></div>{banner}
+<div class="grid"><div class="card"><h2>下一交易日預測</h2><div class="big {cl}">傾向{top}</div><div class="sub">信心：{conf}</div>{bars}</div>
+<div class="card"><h2>因子綜合評價（26 項平均）</h2><div class="big">{composite:+.2f}</div><div class="gauge"><u style="left:{(composite + 2) / 4 * 100:.0f}%"></u></div>
+<div class="sub" style="display:flex;justify-content:space-between"><span>−2 偏空</span><span>+2 偏多</span></div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
+<div class="card"><h2>主要驅動因子</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
+{stats}
+<div class="card"><h2>26 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>分數</th><th>來源</th></tr>{"".join(rows)}</table></div>
+<p class="note">分數為 −2（偏空）到 +2（偏多）的規則化評價；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
+{hist}
+<p class="note">台北 20:00 時美股當日尚未開盤，美股資料為前一美股日收盤。本頁僅供參考，不構成投資建議。</p></div></body></html>"""
+
+
 # ----------------------------- 主程式 -----------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -582,6 +684,16 @@ def main():
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
     print(text)
+    try:
+        os.makedirs("docs", exist_ok=True)
+        note = (f"模型使用 {len(feat_cols)} 個特徵" + ("，含法人籌碼" if use_inst else "，法人籌碼累積中")
+                + ("，含外資持股與融資融券。" if use_extra else "。"))
+        page = render_html(asof, float(c.iloc[-1]), float(c.pct_change().iloc[-1]), c.tail(60), p, top, conf,
+                           composite, F, bt, live_stats, window, note, now, "data/predictions.csv")
+        with open("docs/index.html", "w", encoding="utf-8") as fh:
+            fh.write(page)
+    except Exception as e:
+        print(f"[warn] 產生網頁失敗: {e}")
 
     # ---- 推播(可選) ----
     tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
