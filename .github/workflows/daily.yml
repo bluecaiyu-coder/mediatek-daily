@@ -3,7 +3,7 @@ name: mediatek-daily
 on:
   schedule:
     # GitHub cron 使用 UTC：00:30 UTC = 台北 08:30，週一至週五
-    - cron: "20 0 * * 1-5"
+    - cron: "30 0 * * 1-5"
   workflow_dispatch:
     inputs:
       backfill:
@@ -35,7 +35,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python mediatek_daily.py --backfill "${{ github.event.inputs.backfill || '0' }}"
+        run: python mediatek_daily.py --backfill "${{ github.event.inputs.backfill || '0' }}" --mode "${{ github.event_name == 'schedule' && 'scheduled' || 'live' }}"
 
       - name: Commit reports and caches
         run: |
