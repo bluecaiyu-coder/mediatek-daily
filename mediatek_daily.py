@@ -405,8 +405,42 @@ def walk_forward(data, cols, window):
     }
 
 
+FEAT_ZH = dict(x.split("=") for x in (
+    "ret1=當日漲跌;ret5=5日漲跌;ret20=20日漲跌;ma5_gap=5日均線乖離;ma20_gap=20日均線乖離;ma60_gap=60日均線乖離;"
+    "rsi14=RSI;macd_hist=MACD柱;kd_k=KD-K值;kd_diff=K減D;bb_pos=布林位置;vol_ratio=量比;range_pos=20日區間位置;"
+    "tsmc_ret=台積電;twii_ret=加權指數;novatek_ret=聯詠;realtek_ret=瑞昱;sp500_ret=S&P500;nasdaq_ret=那斯達克;"
+    "dow_ret=道瓊;sox_ret=費半;qcom_ret=高通;avgo_ret=博通;wti_ret=WTI油價;brent_ret=布蘭特油價;dxy_ret=美元指數;"
+    "usdtwd_ret=美元兌台幣;googl_ret=Google股價;vix=VIX水準;vix_chg=VIX變化;us10y_chg=美債殖利率變化;"
+    "foreign_5d=外資5日買賣超;trust_5d=投信5日買賣超;dealer_5d=自營商5日買賣超;"
+    "foreign_ratio_chg5=外資持股比例變化;margin_chg5=融資餘額變化;short_chg5=融券餘額變化").split(";"))
+MODEL_DRIVERS = {}
+SCEN = {}
+RUN = {"mode": "scheduled", "label": "排程模式"}
+
+
+def price_scenarios(data, window, p, px):
+    """各情境價位 = 目前價位 × (1 + 訓練期該類別的平均次日報酬)；機率加權為期望值。"""
+    d = data.tail(window)
+    m = [float(d.loc[d["y"] == k, "nxt"].mean()) if (d["y"] == k).any() else 0.0 for k in (0, 1, 2)]
+    er = float(np.dot(p, m))
+    return {"rets": m, "px": [px * (1 + r) for r in m], "exp_r": er, "exp_px": px * (1 + er), "base": px}
+
+
+
+def model_drivers(model, x_live, feat_cols, k=5):
+    """各特徵對『上漲 vs 下跌』對數勝算的貢獻 = (係數差) × (標準化後數值)。"""
+    sc_, lr = model.named_steps["standardscaler"], model.named_steps["logisticregression"]
+    cl_ = list(lr.classes_.astype(int))
+    if 0 not in cl_ or 2 not in cl_:
+        return {}
+    w = lr.coef_[cl_.index(2)] - lr.coef_[cl_.index(0)]
+    con = pd.Series(w * (x_live.values[0] - sc_.mean_) / sc_.scale_, index=feat_cols).sort_values()
+    fmt = lambda ser: [(FEAT_ZH.get(n, n), float(v)) for n, v in ser.items()]
+    return {"up": fmt(con.tail(k)[::-1]), "down": fmt(con.head(k))}
+
+
 # ----------------------------- 實盤預測追蹤 -----------------------------
-def update_predictions(c, asof, p):
+def update_predictions(c, asof, p, write=True):
     path = "data/predictions.csv"
     cols = ["asof", "p_down", "p_flat", "p_up", "pred", "actual"]
     df = (pd.read_csv(path, dtype=object) if os.path.exists(path)
@@ -417,11 +451,12 @@ def update_predictions(c, asof, p):
             d = pd.Timestamp(row["asof"])
             if d in nxt.index and pd.notna(nxt[d]):
                 df.at[i, "actual"] = cls(nxt[d])
-    df = df[df["asof"] != asof]
-    names = ["down", "flat", "up"]
-    df.loc[len(df)] = [asof, f"{p[0]:.4f}", f"{p[1]:.4f}", f"{p[2]:.4f}",
-                       names[int(np.argmax(p))], np.nan]
-    df.to_csv(path, index=False)
+    if write:
+        df = df[df["asof"] != asof]
+        names = ["down", "flat", "up"]
+        df.loc[len(df)] = [asof, f"{p[0]:.4f}", f"{p[1]:.4f}", f"{p[2]:.4f}",
+                           names[int(np.argmax(p))], np.nan]
+        df.to_csv(path, index=False)
     done = df.dropna(subset=["actual"])
     if done.empty:
         return None
@@ -528,16 +563,30 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
             gl.append(f'<li><span class="bd">{lab}</span> <a href="{_e(l_)}" target="_blank" rel="noopener">{_e(t_)}</a> <span class="sub">{_e(d_)}</span></li>')
     gcard = ('<div class="card"><h2>Google / TPU 動態新聞</h2><ul style="padding-left:18px;margin:0;line-height:1.9">'
              + "".join(gl) + "</ul></div>") if gl else ""
-    banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else ""
+    scard = ""
+    if SCEN:
+        t_ = lambda n, k: f'<div class="stat"><small>{n}</small><b class="{k}">{SCEN["px"][{"up": 2, "flat": 1, "down": 0}[k]]:.1f}</b><small>{SCEN["rets"][{"up": 2, "flat": 1, "down": 0}[k]] * 100:+.2f}%</small></div>'
+        scard = ('<div class="card"><h2>參考價位（情境，以目前價位 %.1f 計）</h2><div class="stats">' % SCEN["base"]
+                 + t_("上漲情境", "up") + t_("盤整情境", "flat") + t_("下跌情境", "down")
+                 + f'<div class="stat"><small>機率加權預期價</small><b>{SCEN["exp_px"]:.1f}</b><small>{SCEN["exp_r"] * 100:+.2f}%</small></div></div>'
+                 + '<p class="note">各情境＝目前價位套用訓練期該類別的平均次日報酬；加權預期價為機率期望值。僅為統計平均，非保證。</p></div>')
+    mcard = ""
+    if MODEL_DRIVERS:
+        ch = lambda L_, k_: "".join(f'<span class="chip {k_}">{_e(n)} {v:+.2f}</span>' for n, v in L_)
+        mcard = ('<div class="card"><h2>模型實際看法（真正決定機率的因子）</h2><div class="sub">推高上漲機率</div>'
+                 + ch(MODEL_DRIVERS["up"], "s1") + '<div class="sub" style="margin-top:6px">壓低上漲機率</div>'
+                 + ch(MODEL_DRIVERS["down"], "m1")
+                 + '<p class="note">數值為對「上漲 vs 下跌」對數勝算的貢獻；與上方規則化分數無關，兩者可能不一致。</p></div>')
+    banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else ('<div class="warn">即時模式：已納入最新盤後價與盤中資料，可能重複計入台股已反映的行情，僅供感受方向；不列入實盤命中率追蹤。</div>' if RUN["mode"] == "live" else "")
     return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>聯發科 2454 每日預測</title><style>{CSS}</style></head><body><div class="wrap">
-<div class="top"><div><h1>聯發科 2454 · 每日預測儀表板</h1><div class="sub">資料日 {asof:%Y-%m-%d} ｜ 更新 {_e(now)}（台北）｜ 紅漲綠跌</div></div>
+<div class="top"><div><h1>聯發科 2454 · 每日預測儀表板</h1><div class="sub">資料日 {asof:%Y-%m-%d} ｜ 更新 {_e(now)}（台北）｜ 紅漲綠跌 ｜ {_e(RUN["label"])} ｜ <a href="index.html">排程版</a> · <a href="live.html">即時版</a></div></div>
 <div style="text-align:right"><div class="big {'up' if chg1 >= 0 else 'down'}">{px:.1f}</div><div class="sub {'up' if chg1 >= 0 else 'down'}">{chg1 * 100:+.2f}%</div></div></div>{banner}
 <div class="grid"><div class="card"><h2>下一交易日預測</h2><div class="big {cl}">傾向{top}</div><div class="sub">信心：{conf}</div>{bars}</div>
 <div class="card"><h2>因子綜合評價（加權平均）</h2><div class="big">{composite:+.1f}</div><div class="gauge"><u style="left:{(composite + 10) / 20 * 100:.0f}%"></u></div>
 <div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
-<div class="card"><h2>主要驅動因子</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
-{gcard}{stats}
+<div class="card"><h2>顯示分數最極端的因子（規則化評價，非模型）</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
+{scard}{mcard}{gcard}{stats}
 <div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>分數</th><th>來源</th></tr>{"".join(rows)}</table></div>
 <p class="note">分數為 −10（偏空）到 +10（偏多）的規則化評價，綜合分依來源加權（Google 類 1.5、新聞 0.5、其餘 1.0）；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
 {hist}
@@ -548,7 +597,12 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--backfill", type=int, default=0, help="一次回補多少天法人資料")
+    ap.add_argument("--mode", choices=["scheduled", "live"], default="scheduled",
+                    help="scheduled=排程版(依設計推進)；live=手動即時版(納入全部最新資訊)")
     args = ap.parse_args()
+    RUN["mode"] = args.mode
+    RUN["label"] = "即時模式(手動)" if args.mode == "live" else "排程模式"
+    live_mode = args.mode == "live"
     os.makedirs("data", exist_ok=True)
     os.makedirs("reports", exist_ok=True)
 
@@ -564,10 +618,19 @@ def main():
     except Exception as e:
         print(f"[warn] GOOGL 盤後價失敗: {e}")
     gd = close["googl"].dropna()
-    if ah and len(gd) and ah["reg_date"] == gd.index[-1].date():
-        f.loc[f.index[-1], "googl_ret"] = (1 + googl_reg) * (1 + ah["move"]) - 1
-    else:
+    if not (ah and len(gd) and ah["reg_date"] == gd.index[-1].date()):
         ah = None
+    ah_fresh = bool(ah and (live_mode or ah["ts"] > pd.Timestamp(f.index[-1]).tz_localize(TZ_TW) + pd.Timedelta(hours=13, minutes=30)))
+    if ah_fresh:
+        f.loc[f.index[-1], "googl_ret"] = (1 + googl_reg) * (1 + ah["move"]) - 1
+    if live_mode:
+        for key_, tk_ in (("qcom", "QCOM"), ("avgo", "AVGO")):
+            try:
+                a2, g2 = fetch_afterhours(tk_), close[key_].dropna()
+                if a2 and len(g2) and a2["reg_date"] == g2.index[-1].date():
+                    f.loc[f.index[-1], f"{key_}_ret"] = (1 + f[f"{key_}_ret"].iloc[-1]) * (1 + a2["move"]) - 1
+            except Exception as e:
+                print(f"[warn] {tk_} 盤後價失敗: {e}")
 
     # 法人籌碼：快取累積，量夠才進模型
     cache = update_inst_cache(list(f.index), args.backfill)
@@ -618,11 +681,14 @@ def main():
 
     live = make_model().fit(data[feat_cols].tail(window), data["y"].tail(window))
     x_live = f[feat_cols].iloc[[-1]].fillna(0)
+    x_live = x_live.clip(lower=data[feat_cols].quantile(0.005), upper=data[feat_cols].quantile(0.995), axis=1)
     p = proba(live, x_live)[0]
     names = ["下跌", "盤整", "上漲"]
     top = names[int(np.argmax(p))]
     conf = "低" if p.max() < 0.45 else "中" if p.max() < 0.60 else "高"
-    live_stats = update_predictions(c, asof.strftime("%Y-%m-%d"), p)
+    SCEN.update(price_scenarios(data, window, p, float(c.iloc[-1])))
+    MODEL_DRIVERS.update(model_drivers(live, x_live, feat_cols))
+    live_stats = update_predictions(c, asof.strftime("%Y-%m-%d"), p, write=not live_mode)
 
     # 新聞
     news = {}
@@ -725,8 +791,8 @@ def main():
         clip_int(googl_reg / sd_g * 5) if sd_g else None, "模型")
     add("產業", "Google(GOOGL)盤後最新價",
         (f"收盤 {ah['reg_close']:.2f} → 最新 {ah['last']:.2f}（{pc(ah['move'])}，{ah['ts']:%m/%d %H:%M} 台北）"
-         if ah else "n/a（盤後資料取得失敗）"),
-        clip_int(ah["move"] / sd_g * 5) if ah and sd_g else None, "即時(yfinance)")
+         + ("" if ah_fresh else "【已反映於台股今日走勢，未計入預測】") if ah else "n/a（盤後資料取得失敗）"),
+        clip_int(ah["move"] / sd_g * 5) if ah_fresh and sd_g else None, "即時(yfinance)")
     nrow("產業", "Google TPU×聯發科新聞(中文)", "g_tw")
     nrow("產業", "Google TPU 國際新聞(英文)", "g_en")
     nrow("產業", "Alphabet AI晶片/資本支出動態", "g_ai")
@@ -746,7 +812,7 @@ def main():
 
     # ---- 報告 ----
     now = dt.datetime.now(TZ_TW).strftime("%Y-%m-%d %H:%M")
-    L = [f"# 聯發科(2454) 每日日報", f"產生時間：{now} (台北)　資料日：{asof.date()}　收盤：{c.iloc[-1]:.1f}", ""]
+    L = [f"# 聯發科(2454) 每日日報", f"產生時間：{now} (台北)　資料日：{asof.date()}　收盤：{c.iloc[-1]:.1f}　模式：{RUN['label']}", ""]
     L += ["## 次一交易日預測",
           f"- **上漲 {p[2]*100:.0f}% ／ 盤整 {p[1]*100:.0f}% ／ 下跌 {p[0]*100:.0f}%** → 傾向「{top}」，信心：{conf}",
           f"- 因子加權綜合分(-10~+10，僅顯示用)：{composite:+.1f}",
@@ -764,6 +830,15 @@ def main():
         da = "n/a" if live_stats["dir_acc"] is None else f"{live_stats['dir_acc']*100:.1f}%"
         L += ["", "## 實盤追蹤(本腳本每日預測 vs 實際)",
               f"- 已驗證 {live_stats['n']} 天；三分類命中 {live_stats['acc']*100:.1f}%；方向命中 {da}(n={live_stats['n_dir']})"]
+    if SCEN:
+        sn = SCEN
+        L += ["", f"## 參考價位(情境，以目前價位 {sn['base']:.1f} 計)",
+              f"- 上漲情境：{sn['px'][2]:.1f}（{sn['rets'][2]*100:+.2f}%）／盤整：{sn['px'][1]:.1f}（{sn['rets'][1]*100:+.2f}%）／下跌：{sn['px'][0]:.1f}（{sn['rets'][0]*100:+.2f}%）",
+              f"- 機率加權預期價：**{sn['exp_px']:.1f}（{sn['exp_r']*100:+.2f}%）**　※訓練期各類別平均報酬的統計值，非保證"]
+    if MODEL_DRIVERS:
+        L += ["", "## 模型實際看法(與下表顯示分數無關)",
+              "- 推高「上漲」最多：" + "、".join(f"{n}({v:+.2f})" for n, v in MODEL_DRIVERS["up"]),
+              "- 壓低「上漲」最多：" + "、".join(f"{n}({v:+.2f})" for n, v in MODEL_DRIVERS["down"])]
     L += ["", f"## {len(F)} 項因子", "| # | 類別 | 因子 | 最新值 | 分數(-10~+10) | 來源 |", "|---|---|---|---|---|---|"]
     for i, g, n, v, s, src in F:
         L.append(f"| {i} | {g} | {n} | {str(v).replace('|', '/')} | {'—' if s is None else f'{s:+d}'} | {src} |")
@@ -773,7 +848,7 @@ def main():
           "> 本報告僅供參考，不構成投資建議。"]
     text = "\n".join(L)
     day = asof.strftime("%Y-%m-%d")
-    for path in (f"reports/{day}.md", "reports/latest.md"):
+    for path in (["reports/live.md"] if live_mode else [f"reports/{day}.md", "reports/latest.md"]):
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
     print(text)
@@ -783,7 +858,7 @@ def main():
                 + ("，含外資持股與融資融券。" if use_extra else "。"))
         page = render_html(asof, float(c.iloc[-1]), float(c.pct_change().iloc[-1]), c.tail(60), p, top, conf,
                            composite, F, bt, live_stats, window, note, now, "data/predictions.csv")
-        with open("docs/index.html", "w", encoding="utf-8") as fh:
+        with open("docs/live.html" if live_mode else "docs/index.html", "w", encoding="utf-8") as fh:
             fh.write(page)
     except Exception as e:
         print(f"[warn] 產生網頁失敗: {e}")
