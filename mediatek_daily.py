@@ -537,8 +537,8 @@ def _e(x):
 
 def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, window,
                 note, now, hist_path, sample=False):
-    lean, d_ = lean_label(p)
-    cl = "up" if d_ >= .08 else "down" if d_ <= -.08 else "flat"
+    lean, net_ = lean_label(p)
+    cl = "up" if net_ >= .08 else "down" if net_ <= -.08 else "flat"
     v = list(spark)
     lo, hi = min(v), max(v)
     pts = " ".join(f"{i * 316 / (len(v) - 1) + 2:.1f},{66 - (x - lo) / ((hi - lo) or 1) * 58:.1f}" for i, x in enumerate(v))
@@ -629,8 +629,8 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>聯發科 2454 每日預測</title><style>{CSS}</style></head><body><div class="wrap">
 <div class="top"><div><h1>聯發科 2454 · 每日預測儀表板</h1><div class="sub">資料日 {asof:%Y-%m-%d} ｜ 更新 {_e(now)}（台北）｜ 紅漲綠跌 ｜ {_e(RUN["label"])} ｜ <a href="index.html">排程版</a> · <a href="live.html">即時版</a></div></div>
 <div style="text-align:right"><div class="big {'up' if chg1 >= 0 else 'down'}">{px:.1f}</div><div class="sub {'up' if chg1 >= 0 else 'down'}">{chg1 * 100:+.2f}%</div></div></div>{banner}
-<div class="grid"><div class="card"><h2>下一交易日預測</h2><div class="big {cl}">{lean}</div><div class="sub">上漲 − 下跌 ＝ {d_ * 100:+.0f} 個百分點｜信心：{conf}</div>{bars}</div>
-<div class="card"><h2>模型多空傾向</h2><div class="big {cl}">{d_ * 10:+.1f}</div><div class="gauge"><u style="left:{(d_ * 10 + 10) / 20 * 100:.0f}%"></u></div>
+<div class="grid"><div class="card"><h2>下一交易日預測</h2><div class="big {cl}">{lean}</div><div class="sub">上漲 − 下跌 ＝ {net_ * 100:+.0f} 個百分點｜信心：{conf}</div>{bars}</div>
+<div class="card"><h2>模型多空傾向</h2><div class="big {cl}">{net_ * 10:+.1f}</div><div class="gauge"><u style="left:{(net_ * 10 + 10) / 20 * 100:.0f}%"></u></div>
 <div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div class="note" style="margin-top:8px">＝（上漲機率 − 下跌機率）×10，由預測模型直接算出。表格「規則分數」的均分為 {composite:+.1f}，是我訂的簡易規則，不是模型輸出，兩者不同很正常。</div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
 <div class="card"><h2>顯示分數最極端的因子（規則化評價，非模型）</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
 {lcard}{scard}{mcard}{gcard}{stats}
@@ -922,8 +922,15 @@ def main():
                            composite, F, bt, live_stats, window, note, now, "data/predictions.csv")
         with open("docs/live.html" if live_mode else "docs/index.html", "w", encoding="utf-8") as fh:
             fh.write(page)
-    except Exception as e:
-        print(f"[warn] 產生網頁失敗: {e}")
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        print("[warn] 產生網頁失敗:\n" + tb)
+        with open("docs/live.html" if live_mode else "docs/index.html", "w", encoding="utf-8") as fh:
+            fh.write("<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+                     "<body style='font-family:sans-serif;padding:20px;max-width:900px;margin:auto'><h2>網頁產生失敗</h2>"
+                     f"<p>{_html.escape(now)}：報告檔 reports/*.md 仍已更新。請把下方錯誤文字貼給開發者：</p>"
+                     f"<pre style='white-space:pre-wrap;background:#f4f4f4;padding:12px'>{_html.escape(tb)}</pre>")
 
     # ---- 推播(可選) ----
     tok, chat = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
