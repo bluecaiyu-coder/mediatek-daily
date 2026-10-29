@@ -182,7 +182,7 @@ def update_inst_cache(trading_dates, backfill):
              if os.path.exists(path) else
              pd.DataFrame(columns=["foreign", "trust", "dealer"]))
     cache.index = pd.to_datetime(cache.index)
-    lookback = max(60, backfill, 300 if len(cache) < MIN_INST_ROWS else 0)
+    lookback = max(60, backfill, 1300 if len(cache) < 1000 else 0)
     want = [d for d in trading_dates[-lookback:] if d not in cache.index]
     if want:
         fm = None
@@ -213,6 +213,60 @@ def update_inst_cache(trading_dates, backfill):
     cache.index.name = "date"
     cache.to_csv(path)
     print(f"[info] 法人快取共 {len(cache)} 天")
+    return cache
+
+
+FINMIND = "https://api.finmindtrade.com/api/v4/data"
+
+
+def fetch_finmind_raw(dataset, start):
+    r = requests.get(FINMIND, params={"dataset": dataset, "data_id": CODE,
+                                      "start_date": start}, headers=UA, timeout=60)
+    j = r.json()
+    if j.get("status") != 200 or not j.get("data"):
+        print(f"[warn] FinMind {dataset} status={j.get('status')} msg={j.get('msg')}")
+        return None
+    df = pd.DataFrame(j["data"])
+    df["date"] = pd.to_datetime(df["date"])
+    return df.set_index("date").sort_index()
+
+
+def update_chip_extra(asof):
+    """外資持股比例(%)、融資餘額(張)、融券餘額(張)，快取於 data/chip_extra.csv。"""
+    path = "data/chip_extra.csv"
+    cols = ["foreign_ratio", "margin_bal", "short_bal"]
+    cache = (pd.read_csv(path, index_col=0, parse_dates=True)
+             if os.path.exists(path) else pd.DataFrame(columns=cols))
+    cache.index = pd.to_datetime(cache.index)
+    cache = cache.reindex(columns=cols).astype(float)
+    start = ((asof - pd.Timedelta(days=1900)) if len(cache) < 1000
+             else (cache.index.max() - pd.Timedelta(days=7))).strftime("%Y-%m-%d")
+    plan = (("TaiwanStockShareholding", {"foreign_ratio": "ForeignInvestmentSharesRatio"}),
+            ("TaiwanStockMarginPurchaseShortSale",
+             {"margin_bal": "MarginPurchaseTodayBalance",
+              "short_bal": "ShortSaleTodayBalance"}))
+    parts = {}
+    for ds, mapping in plan:
+        try:
+            raw = fetch_finmind_raw(ds, start)
+        except Exception as e:
+            print(f"[warn] FinMind {ds} 失敗: {e}")
+            continue
+        if raw is None:
+            continue
+        for name, src in mapping.items():
+            if src in raw.columns:
+                parts[name] = pd.to_numeric(raw[src], errors="coerce")
+            else:
+                print(f"[warn] {ds} 缺欄位 {src}，實際欄位：{list(raw.columns)}")
+    if parts:
+        new = pd.DataFrame(parts)
+        new = new[~new.index.duplicated(keep="last")]
+        cache = new.combine_first(cache)
+    cache = cache.reindex(columns=cols).sort_index()
+    cache.index.name = "date"
+    cache.to_csv(path)
+    print(f"[info] 籌碼補充快取共 {len(cache)} 天")
     return cache
 
 
@@ -355,8 +409,25 @@ def main():
             if len(rs):
                 f.loc[f.index[-1], col] = rs.iloc[-1]
 
-    base_cols = [x for x in f.columns if x not in ("nxt", *inst_cols)]
-    feat_cols = base_cols + (inst_cols if use_inst else [])
+    # 外資持股比例、融資融券
+    chip = update_chip_extra(asof)
+    f["foreign_ratio_chg5"] = (chip["foreign_ratio"] - chip["foreign_ratio"].shift(5)).reindex(f.index)
+    f["margin_chg5"] = chip["margin_bal"].pct_change(5, fill_method=None).reindex(f.index)
+    f["short_chg5"] = chip["short_bal"].pct_change(5, fill_method=None).reindex(f.index)
+    extra_cols = ["foreign_ratio_chg5", "margin_chg5", "short_chg5"]
+    use_extra = all(f[c_].notna().sum() >= MIN_INST_ROWS for c_ in extra_cols)
+    chip_chg = pd.DataFrame({
+        "foreign_ratio_chg5": chip["foreign_ratio"] - chip["foreign_ratio"].shift(5),
+        "margin_chg5": chip["margin_bal"].pct_change(5, fill_method=None),
+        "short_chg5": chip["short_bal"].pct_change(5, fill_method=None)})
+    for col in extra_cols:  # 最新一天尚未公布時，即時預測列沿用最近可得值
+        if pd.isna(f[col].iloc[-1]):
+            rs = chip_chg[col].dropna()
+            if len(rs):
+                f.loc[f.index[-1], col] = rs.iloc[-1]
+
+    base_cols = [x for x in f.columns if x not in ("nxt", *inst_cols, *extra_cols)]
+    feat_cols = base_cols + (inst_cols if use_inst else []) + (extra_cols if use_extra else [])
 
     data = f.dropna(subset=feat_cols + ["nxt"]).copy()
     data["y"] = data["nxt"].map(cls).map({"down": 0, "flat": 1, "up": 2}).astype(int)
@@ -407,8 +478,21 @@ def main():
                 txt += f"（資料至 {rs.index[-1]:%m/%d}）"
         add("籌碼", f"{nm}近5日買賣超(聯發科)", txt,
             inst_score(v, inst_all[key]), "FinMind" + ("/模型" if use_inst else "/累積中"))
-    add("籌碼", "外資持股比例變化", "未自動化", None, "待擴充")
-    add("籌碼", "融資融券餘額變化", "未自動化", None, "待擴充")
+    def lastv(series):
+        x = series.dropna()
+        return x.iloc[-1] if len(x) else float("nan")
+
+    src_x = "FinMind" + ("/模型" if use_extra else "/累積中")
+    fr, frc = lastv(chip["foreign_ratio"]), lastv(chip_chg["foreign_ratio_chg5"])
+    add("籌碼", "外資持股比例變化",
+        "n/a" if pd.isna(fr) else f"{fr:.2f}%（5日 {frc:+.2f} 個百分點）",
+        zs(f["foreign_ratio_chg5"]), src_x)
+    mb, sb = lastv(chip["margin_bal"]), lastv(chip["short_bal"])
+    add("籌碼", "融資融券餘額變化",
+        "n/a" if pd.isna(mb) else
+        f"融資 {mb:,.0f} 張（5日 {pc(lastv(chip_chg['margin_chg5']))}）／"
+        f"融券 {sb:,.0f} 張（5日 {pc(lastv(chip_chg['short_chg5']))}）",
+        zs(f["margin_chg5"], -1), src_x)
     vr = last["vol_ratio"]
     sgn = np.sign(last["ret1"])
     add("籌碼", "成交量/20日均量", f"{vr:.2f}x",
@@ -482,7 +566,7 @@ def main():
     for i, g, n, v, s, src in F:
         L.append(f"| {i} | {g} | {n} | {str(v).replace('|', '/')} | {'—' if s is None else f'{s:+d}'} | {src} |")
     L += ["", "> 註：「新聞關鍵字」僅對標題做正負詞計數，非真正語意判斷，無歷史資料可回測，未納入模型；"
-              "「待擴充」項目尚未自動化。分數為顯示用的規則化評價，模型權重由歷史資料估計。",
+              "融資增加視為偏空僅為顯示用的經驗規則。分數為顯示用的規則化評價，模型權重由歷史資料估計。",
           "> 時間差提醒：台北 20:00 時美股當日尚未開盤，美股資料為前一美股日收盤。",
           "> 本報告僅供參考，不構成投資建議。"]
     text = "\n".join(L)
