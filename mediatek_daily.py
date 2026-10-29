@@ -420,6 +420,24 @@ FEAT_ZH = dict(x.split("=") for x in (
     "foreign_5d=外資5日買賣超;trust_5d=投信5日買賣超;dealer_5d=自營商5日買賣超;"
     "foreign_ratio_chg5=外資持股比例變化;margin_chg5=融資餘額變化;short_chg5=融券餘額變化").split(";"))
 MODEL_DRIVERS = {}
+FACTOR_CONTRIB = {}
+FACTOR_FEATS = {
+    "外資近5日買賣超(聯發科)": ["foreign_5d"], "投信近5日買賣超(聯發科)": ["trust_5d"],
+    "自營商近5日買賣超(聯發科)": ["dealer_5d"], "外資持股比例變化": ["foreign_ratio_chg5"],
+    "融資融券餘額變化": ["margin_chg5", "short_chg5"], "成交量/20日均量": ["vol_ratio"],
+    "相對5/20/60日均線": ["ma5_gap", "ma20_gap", "ma60_gap"], "RSI(14)": ["rsi14"],
+    "KD與MACD": ["kd_k", "kd_diff", "macd_hist"], "布林通道位置": ["bb_pos"], "20日支撐/壓力位置": ["range_pos"],
+    "美股四大指數(前一美股日)": ["dow_ret", "sp500_ret", "nasdaq_ret"], "VIX恐慌指數": ["vix", "vix_chg"],
+    "美元指數/美債10年": ["dxy_ret", "us10y_chg"], "美元兌新台幣": ["usdtwd_ret"],
+    "費半與台積電": ["sox_ret", "tsmc_ret"], "高通/博通/聯詠/瑞昱": ["qcom_ret", "avgo_ret", "novatek_ret", "realtek_ret"],
+    "Google(GOOGL)正規盤收盤漲跌": ["googl_ret"], "國際油價(WTI/布蘭特)": ["wti_ret", "brent_ret"]}
+
+
+def lean_label(p):
+    d = float(p[2] - p[0])
+    return ("明顯偏多" if d >= .20 else "略偏多" if d >= .08 else "方向不明" if d > -.08
+            else "略偏空" if d > -.20 else "明顯偏空"), d
+
 SCEN = {}
 LIVE_QUOTES = []
 RUN = {"mode": "scheduled", "label": "排程模式"}
@@ -443,7 +461,9 @@ def model_drivers(model, x_live, feat_cols, k=5):
     w = lr.coef_[cl_.index(2)] - lr.coef_[cl_.index(0)]
     con = pd.Series(w * (x_live.values[0] - sc_.mean_) / sc_.scale_, index=feat_cols).sort_values()
     fmt = lambda ser: [(FEAT_ZH.get(n, n), float(v)) for n, v in ser.items()]
-    return {"up": fmt(con.tail(k)[::-1]), "down": fmt(con.head(k))}
+    b = float(lr.intercept_[cl_.index(2)] - lr.intercept_[cl_.index(0)])
+    return {"up": fmt(con.tail(k)[::-1]), "down": fmt(con.head(k)), "base": b,
+            "contrib": con.to_dict(), "total": float(b + con.sum())}
 
 
 # ----------------------------- 實盤預測追蹤 -----------------------------
@@ -517,7 +537,8 @@ def _e(x):
 
 def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, window,
                 note, now, hist_path, sample=False):
-    cl = {"上漲": "up", "盤整": "flat", "下跌": "down"}[top]
+    lean, d_ = lean_label(p)
+    cl = "up" if d_ >= .08 else "down" if d_ <= -.08 else "flat"
     v = list(spark)
     lo, hi = min(v), max(v)
     pts = " ".join(f"{i * 316 / (len(v) - 1) + 2:.1f},{66 - (x - lo) / ((hi - lo) or 1) * 58:.1f}" for i, x in enumerate(v))
@@ -530,13 +551,23 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
     pos = sorted([x for x in sc if x[4] >= 3], key=lambda x: -x[4])[:4]
     neg = sorted([x for x in sc if x[4] <= -3], key=lambda x: x[4])[:4]
     chips = lambda L, k: "".join(f'<span class="chip {k}">{_e(x[2])} {x[4]:+d}</span>' for x in L) or '<span class="sub">無</span>'
+    def fc(n):
+        v_ = FACTOR_CONTRIB.get(n)
+        return "—" if v_ is None else f'<span class="{"up" if v_ >= 0 else "down"}">{v_:+.2f}</span>'
+
     rows, g = [], None
     for i, grp, n, val, scr, src in F:
         if grp != g:
             g = grp
-            rows.append(f'<tr class="g"><td colspan="5">{_e(grp)}</td></tr>')
+            rows.append(f'<tr class="g"><td colspan="6">{_e(grp)}</td></tr>')
         chip = f'<span class="s {sclass(scr)}">{scr:+d}</span>' if scr is not None else '<span class="s sn">—</span>'
-        rows.append(f"<tr><td>{i}</td><td>{_e(n)}</td><td>{_e(val)}</td><td>{chip}</td><td><span class='bd'>{_e(src)}</span></td></tr>")
+        rows.append(f"<tr><td>{i}</td><td>{_e(n)}</td><td>{_e(val)}</td><td>{chip}</td><td>{fc(n)}</td><td><span class='bd'>{_e(src)}</span></td></tr>")
+    if MODEL_DRIVERS:
+        rows.append('<tr class="g"><td colspan="6">模型合計（對數勝算 ln(上漲 / 下跌)）</td></tr>')
+        for lab_, v_ in (("其他特徵（近期漲跌、加權指數等）", FACTOR_CONTRIB.get("__other__", 0.0)),
+                         ("基準傾向（截距：訓練期上漲日 vs 下跌日）", MODEL_DRIVERS["base"]),
+                         ("合計", MODEL_DRIVERS["total"])):
+            rows.append(f'<tr><td></td><td>{lab_}</td><td></td><td></td><td><b class="{"up" if v_ >= 0 else "down"}">{v_:+.2f}</b></td><td></td></tr>')
     stats = ""
     if bt:
         ok = bt["acc"] >= .9 or bt["dir_acc"] >= .9
@@ -592,18 +623,18 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
         mcard = ('<div class="card"><h2>模型實際看法（真正決定機率的因子）</h2><div class="sub">推高上漲機率</div>'
                  + ch(MODEL_DRIVERS["up"], "s1") + '<div class="sub" style="margin-top:6px">壓低上漲機率</div>'
                  + ch(MODEL_DRIVERS["down"], "m1")
-                 + '<p class="note">數值為對「上漲 vs 下跌」對數勝算的貢獻；與上方規則化分數無關，兩者可能不一致。</p></div>')
+                 + f'<p class="note">基準傾向（模型截距，反映訓練期上漲日與下跌日的比例）：{MODEL_DRIVERS.get("base", 0):+.2f}；各因子貢獻加上基準傾向 ＝ ln(上漲/下跌) ＝ {MODEL_DRIVERS.get("total", 0):+.2f}。與規則分數無關，兩者可能不一致。</p></div>')
     banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else ('<div class="warn">即時模式：下方「即時行情」僅供顯示，預測模型與排程版採同一套規則、不受即時資料影響；本次結果不列入實盤命中率追蹤。</div>' if RUN["mode"] == "live" else "")
     return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>聯發科 2454 每日預測</title><style>{CSS}</style></head><body><div class="wrap">
 <div class="top"><div><h1>聯發科 2454 · 每日預測儀表板</h1><div class="sub">資料日 {asof:%Y-%m-%d} ｜ 更新 {_e(now)}（台北）｜ 紅漲綠跌 ｜ {_e(RUN["label"])} ｜ <a href="index.html">排程版</a> · <a href="live.html">即時版</a></div></div>
 <div style="text-align:right"><div class="big {'up' if chg1 >= 0 else 'down'}">{px:.1f}</div><div class="sub {'up' if chg1 >= 0 else 'down'}">{chg1 * 100:+.2f}%</div></div></div>{banner}
-<div class="grid"><div class="card"><h2>下一交易日預測</h2><div class="big {cl}">傾向{top}</div><div class="sub">信心：{conf}</div>{bars}</div>
-<div class="card"><h2>因子綜合評價（加權平均）</h2><div class="big">{composite:+.1f}</div><div class="gauge"><u style="left:{(composite + 10) / 20 * 100:.0f}%"></u></div>
-<div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
+<div class="grid"><div class="card"><h2>下一交易日預測</h2><div class="big {cl}">{lean}</div><div class="sub">上漲 − 下跌 ＝ {d_ * 100:+.0f} 個百分點｜信心：{conf}</div>{bars}</div>
+<div class="card"><h2>模型多空傾向</h2><div class="big {cl}">{d_ * 10:+.1f}</div><div class="gauge"><u style="left:{(d_ * 10 + 10) / 20 * 100:.0f}%"></u></div>
+<div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div class="note" style="margin-top:8px">＝（上漲機率 − 下跌機率）×10，由預測模型直接算出。表格「規則分數」的均分為 {composite:+.1f}，是我訂的簡易規則，不是模型輸出，兩者不同很正常。</div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
 <div class="card"><h2>顯示分數最極端的因子（規則化評價，非模型）</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
 {lcard}{scard}{mcard}{gcard}{stats}
-<div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>分數</th><th>來源</th></tr>{"".join(rows)}</table></div>
+<div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>規則分數</th><th>模型貢獻</th><th>來源</th></tr>{"".join(rows)}</table></div>
 <p class="note">分數為 −10（偏空）到 +10（偏多）的規則化評價，綜合分依來源加權（Google 類 1.5、新聞 0.5、其餘 1.0）；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
 {hist}
 <p class="note">每日台北 08:30 更新：美股為前一美股日完整收盤，Google 另附盤後最新價；盤後價無歷史資料，無法回測。本頁僅供參考，不構成投資建議。</p></div></body></html>"""
@@ -704,6 +735,13 @@ def main():
     conf = "低" if p.max() < 0.45 else "中" if p.max() < 0.60 else "高"
     SCEN.update(price_scenarios(data, window, p, float(c.iloc[-1])))
     MODEL_DRIVERS.update(model_drivers(live, x_live, feat_cols))
+    cb, used = MODEL_DRIVERS.get("contrib", {}), set()
+    for nm_, ft_ in FACTOR_FEATS.items():
+        fs_ = [x for x in ft_ if x in cb]
+        if fs_:
+            FACTOR_CONTRIB[nm_] = float(sum(cb[x] for x in fs_))
+            used.update(fs_)
+    FACTOR_CONTRIB["__other__"] = float(sum(v for k_, v in cb.items() if k_ not in used))
     live_stats = update_predictions(c, asof.strftime("%Y-%m-%d"), p, write=not live_mode)
 
     # 新聞
@@ -830,8 +868,8 @@ def main():
     now = dt.datetime.now(TZ_TW).strftime("%Y-%m-%d %H:%M")
     L = [f"# 聯發科(2454) 每日日報", f"產生時間：{now} (台北)　資料日：{asof.date()}　收盤：{c.iloc[-1]:.1f}　模式：{RUN['label']}", ""]
     L += ["## 次一交易日預測",
-          f"- **上漲 {p[2]*100:.0f}% ／ 盤整 {p[1]*100:.0f}% ／ 下跌 {p[0]*100:.0f}%** → 傾向「{top}」，信心：{conf}",
-          f"- 因子加權綜合分(-10~+10，僅顯示用)：{composite:+.1f}",
+          f"- **上漲 {p[2]*100:.0f}% ／ 盤整 {p[1]*100:.0f}% ／ 下跌 {p[0]*100:.0f}%** → {lean_label(p)[0]}（上漲−下跌 {lean_label(p)[1]*100:+.0f} 個百分點），信心：{conf}",
+          f"- 規則化因子加權均分(-10~+10；我訂的簡易規則，非模型輸出，與預測機率不同)：{composite:+.1f}",
           f"- 模型輸入：{len(feat_cols)} 個特徵" + ("(含法人籌碼)" if use_inst else f"(法人籌碼累積中：{len(cache)}/{MIN_INST_ROWS} 天)"),
           "", "## 樣本外回測(滾動式，不偷看未來)"]
     if bt:
@@ -859,9 +897,13 @@ def main():
         L += ["", "## 模型實際看法(與下表顯示分數無關)",
               "- 推高「上漲」最多：" + "、".join(f"{n}({v:+.2f})" for n, v in MODEL_DRIVERS["up"]),
               "- 壓低「上漲」最多：" + "、".join(f"{n}({v:+.2f})" for n, v in MODEL_DRIVERS["down"])]
-    L += ["", f"## {len(F)} 項因子", "| # | 類別 | 因子 | 最新值 | 分數(-10~+10) | 來源 |", "|---|---|---|---|---|---|"]
+    L += ["", f"## {len(F)} 項因子", "| # | 類別 | 因子 | 最新值 | 規則分數(-10~+10) | 模型貢獻 | 來源 |", "|---|---|---|---|---|---|---|"]
     for i, g, n, v, s, src in F:
-        L.append(f"| {i} | {g} | {n} | {str(v).replace('|', '/')} | {'—' if s is None else f'{s:+d}'} | {src} |")
+        L.append(f"| {i} | {g} | {n} | {str(v).replace('|', '/')} | {'—' if s is None else f'{s:+d}'} | {'—' if n not in FACTOR_CONTRIB else format(FACTOR_CONTRIB[n], '+.2f')} | {src} |")
+    if MODEL_DRIVERS:
+        L += [f"| | **模型合計** | 其他特徵(近期漲跌、加權指數等) | | | {FACTOR_CONTRIB.get('__other__', 0):+.2f} | |",
+              f"| | | 基準傾向(截距：訓練期上漲日 vs 下跌日) | | | {MODEL_DRIVERS['base']:+.2f} | |",
+              f"| | | **合計 ln(上漲/下跌)** | | | **{MODEL_DRIVERS['total']:+.2f}** | |"]
     L += ["", "> 註：「新聞關鍵字」僅對標題做正負詞計數，非真正語意判斷，無歷史資料可回測，未納入模型；"
               "融資增加視為偏空僅為顯示用的經驗規則。分數為顯示用的規則化評價，模型權重由歷史資料估計。",
           "> 時間說明：每日台北 08:30 執行，美股為前一美股日完整收盤，Google 另附盤後最新價(yfinance 盤後資料可能延遲或缺漏)。",
