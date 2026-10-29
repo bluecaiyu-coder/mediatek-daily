@@ -111,6 +111,31 @@ def align_prior(series, idx):
     return pd.Series(m["v"].values, index=idx)
 
 
+def align_level(series, idx, cutoffs):
+    """對每個台股交易日，取『下一個台股交易日之前』最新的海外收盤價(嚴格早於 cutoff)。"""
+    s_ = series.dropna()
+    left = pd.DataFrame({"date": pd.to_datetime(cutoffs).astype("datetime64[ns]")})
+    right = pd.DataFrame({"date": pd.to_datetime(s_.index).astype("datetime64[ns]"), "v": s_.values})
+    m = pd.merge_asof(left, right, on="date", direction="backward", allow_exact_matches=False)
+    return pd.Series(m["v"].values, index=idx)
+
+
+def fetch_afterhours(tk):
+    """美股正規盤收盤價與最新盤後(含盤前)價，來源 yfinance 1 分鐘資料(prepost)。"""
+    h = yf.Ticker(tk).history(period="5d", interval="1m", prepost=True)
+    if h is None or h.empty:
+        return None
+    et = h.index.tz_convert("America/New_York")
+    mins = np.asarray(et.hour * 60 + et.minute)
+    reg = h[(mins >= 570) & (mins < 960)]  # 09:30~16:00 ET
+    if reg.empty:
+        return None
+    reg_close, last_px = float(reg["Close"].iloc[-1]), float(h["Close"].iloc[-1])
+    return {"reg_close": reg_close, "last": last_px, "move": last_px / reg_close - 1,
+            "reg_date": reg.index[-1].tz_convert("America/New_York").date(),
+            "ts": h.index[-1].tz_convert(TZ_TW)}
+
+
 # ----------------------------- 資料下載 -----------------------------
 def download():
     tk = {**TW, **OVERSEAS}
@@ -328,13 +353,19 @@ def build_features(close, high, low, vol):
     for key in ("tsmc", "twii", "novatek", "realtek"):
         r = close[key].dropna().pct_change()
         f[f"{key}_ret"] = r.reindex(idx).fillna(0)
-    # 海外資料：只用「嚴格早於 t」的最新收盤
+    # 海外資料：每個台股交易日 r，取下一個台股開盤前最新的美股收盤(涵蓋兩日間所有美股交易日)
+    today = pd.Timestamp(dt.datetime.now(TZ_TW).date())
+    cuts = list(idx[1:]) + [max(today, idx[-1] + pd.Timedelta(days=1))]
+
+    def lvl(key):
+        return align_level(close[key], idx, cuts)
+
     for key in ("sp500", "nasdaq", "dow", "sox", "qcom", "avgo",
                 "wti", "brent", "dxy", "usdtwd", "googl"):
-        f[f"{key}_ret"] = align_prior(close[key].dropna().pct_change(), idx)
-    f["vix"] = align_prior(close["vix"], idx)
-    f["vix_chg"] = align_prior(close["vix"].pct_change(), idx)
-    f["us10y_chg"] = align_prior(close["us10y"].diff(), idx)
+        f[f"{key}_ret"] = lvl(key).pct_change().fillna(0)
+    v_ = lvl("vix")
+    f["vix"], f["vix_chg"] = v_, v_.pct_change()
+    f["us10y_chg"] = lvl("us10y").diff()
 
     f["nxt"] = c.pct_change().shift(-1)
     return f, c
@@ -510,7 +541,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
 <div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>分數</th><th>來源</th></tr>{"".join(rows)}</table></div>
 <p class="note">分數為 −10（偏空）到 +10（偏多）的規則化評價，綜合分依來源加權（Google 類 1.5、新聞 0.5、其餘 1.0）；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
 {hist}
-<p class="note">台北 20:00 時美股當日尚未開盤，美股資料為前一美股日收盤。本頁僅供參考，不構成投資建議。</p></div></body></html>"""
+<p class="note">每日台北 08:30 更新：美股為前一美股日完整收盤，Google 另附盤後最新價；盤後價無歷史資料，無法回測。本頁僅供參考，不構成投資建議。</p></div></body></html>"""
 
 
 # ----------------------------- 主程式 -----------------------------
@@ -524,6 +555,19 @@ def main():
     close, high, low, vol = download()
     f, c = build_features(close, high, low, vol)
     asof = f.index[-1]
+
+    # Google 盤後價：歷史無法回測，僅併入即時預測列(正規盤漲跌 × 盤後漲跌)
+    googl_reg = float(f["googl_ret"].iloc[-1])
+    ah = None
+    try:
+        ah = fetch_afterhours("GOOGL")
+    except Exception as e:
+        print(f"[warn] GOOGL 盤後價失敗: {e}")
+    gd = close["googl"].dropna()
+    if ah and len(gd) and ah["reg_date"] == gd.index[-1].date():
+        f.loc[f.index[-1], "googl_ret"] = (1 + googl_reg) * (1 + ah["move"]) - 1
+    else:
+        ah = None
 
     # 法人籌碼：快取累積，量夠才進模型
     cache = update_inst_cache(list(f.index), args.backfill)
@@ -676,7 +720,13 @@ def main():
 
     nrow("產業", "手機/AI邊緣晶片需求", "demand")
     nrow("產業", "月營收與法說指引", "revenue")
-    add("產業", "Google(GOOGL)股價(前一美股日)", pc(last["googl_ret"]), zs(f["googl_ret"]), "模型")
+    sd_g = f["googl_ret"].tail(250).std()
+    add("產業", "Google(GOOGL)正規盤收盤漲跌", pc(googl_reg),
+        clip_int(googl_reg / sd_g * 5) if sd_g else None, "模型")
+    add("產業", "Google(GOOGL)盤後最新價",
+        (f"收盤 {ah['reg_close']:.2f} → 最新 {ah['last']:.2f}（{pc(ah['move'])}，{ah['ts']:%m/%d %H:%M} 台北）"
+         if ah else "n/a（盤後資料取得失敗）"),
+        clip_int(ah["move"] / sd_g * 5) if ah and sd_g else None, "即時(yfinance)")
     nrow("產業", "Google TPU×聯發科新聞(中文)", "g_tw")
     nrow("產業", "Google TPU 國際新聞(英文)", "g_en")
     nrow("產業", "Alphabet AI晶片/資本支出動態", "g_ai")
@@ -719,7 +769,7 @@ def main():
         L.append(f"| {i} | {g} | {n} | {str(v).replace('|', '/')} | {'—' if s is None else f'{s:+d}'} | {src} |")
     L += ["", "> 註：「新聞關鍵字」僅對標題做正負詞計數，非真正語意判斷，無歷史資料可回測，未納入模型；"
               "融資增加視為偏空僅為顯示用的經驗規則。分數為顯示用的規則化評價，模型權重由歷史資料估計。",
-          "> 時間差提醒：台北 20:00 時美股當日尚未開盤，美股資料為前一美股日收盤。",
+          "> 時間說明：每日台北 08:30 執行，美股為前一美股日完整收盤，Google 另附盤後最新價(yfinance 盤後資料可能延遲或缺漏)。",
           "> 本報告僅供參考，不構成投資建議。"]
     text = "\n".join(L)
     day = asof.strftime("%Y-%m-%d")
