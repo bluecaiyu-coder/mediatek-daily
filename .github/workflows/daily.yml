@@ -2,8 +2,8 @@ name: mediatek-daily
 
 on:
   schedule:
-    # GitHub cron 使用 UTC：12:00 UTC = 台北 20:00，週一至週五
-    - cron: "0 12 * * 1-5"
+    # GitHub cron 使用 UTC：00:30 UTC = 台北 08:30，週一至週五
+    - cron: "20 0 * * 1-5"
   workflow_dispatch:
     inputs:
       backfill:
@@ -12,6 +12,10 @@ on:
 
 permissions:
   contents: write
+
+concurrency:
+  group: mediatek-daily
+  cancel-in-progress: false
 
 jobs:
   report:
