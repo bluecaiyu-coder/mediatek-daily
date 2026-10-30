@@ -11,6 +11,7 @@
 用法：python mediatek_daily.py [--backfill 250]
 """
 import argparse
+import json
 import datetime as dt
 import os
 import time
@@ -440,6 +441,8 @@ def lean_label(p):
 
 SCEN = {}
 LIVE_QUOTES = []
+LIVE_ADJ = []
+STD_PRED = {}
 RUN = {"mode": "scheduled", "label": "排程模式"}
 
 
@@ -464,6 +467,224 @@ def model_drivers(model, x_live, feat_cols, k=5):
     b = float(lr.intercept_[cl_.index(2)] - lr.intercept_[cl_.index(0)])
     return {"up": fmt(con.tail(k)[::-1]), "down": fmt(con.head(k)), "base": b,
             "contrib": con.to_dict(), "total": float(b + con.sum())}
+
+
+def apply_live_quotes(x_live, quotes, close, f, googl_reg, data, feat_cols):
+    """即時版：把最新盤後/盤中價換算成『收盤前價→最新價』的完整報酬，套進即時預測列。"""
+    x2, adj = x_live.copy(), []
+    for q in quotes:
+        key = {"GOOGL": "googl", "AVGO": "avgo", "QCOM": "qcom"}.get(q["tk"])
+        if not key or f"{key}_ret" not in x2.columns:
+            continue
+        gd_ = close[key].dropna()
+        if not len(gd_) or q["reg_date"] != gd_.index[-1].date():
+            continue
+        reg_ = googl_reg if key == "googl" else float(f[f"{key}_ret"].iloc[-1])
+        new_ = (1 + reg_) * (1 + q["move"]) - 1
+        x2[f"{key}_ret"] = new_
+        adj.append(f"{q['name']} {pc(reg_)}→{pc(new_)}")
+    x2 = x2.clip(lower=data[feat_cols].quantile(0.005), upper=data[feat_cols].quantile(0.995), axis=1)
+    return x2, adj
+
+
+# ----------------------------- 方案比對：即時版 vs 標準版 vs 排程版 -----------------------------
+LIVE_LOG = "data/predictions_live.csv"
+MIN_COMPARE_DAYS = 10
+COMPARE = {}
+
+
+def update_live_log(c, asof, p_live, p_std, run_ts, write):
+    """記錄即時版每次預測(同時存當下的標準版機率)；隔天自動填入實際漲跌。"""
+    cols = ["run_ts", "asof", "pl_down", "pl_flat", "pl_up", "ps_down", "ps_flat", "ps_up", "actual"]
+    df = (pd.read_csv(LIVE_LOG, dtype=object) if os.path.exists(LIVE_LOG)
+          else pd.DataFrame(columns=cols))
+    nxt = c.pct_change().shift(-1)
+    for i, row in df.iterrows():
+        if pd.isna(row["actual"]) or row["actual"] == "":
+            d = pd.Timestamp(row["asof"])
+            if d in nxt.index and pd.notna(nxt[d]):
+                df.at[i, "actual"] = cls(nxt[d])
+    if write:
+        df.loc[len(df)] = [run_ts, asof, *[f"{x:.4f}" for x in p_live], *[f"{x:.4f}" for x in p_std], np.nan]
+    if len(df):
+        df.to_csv(LIVE_LOG, index=False)
+
+
+def _metrics(P, y):
+    nf = y != 1
+    return {"n": len(y), "n_dir": int(nf.sum()),
+            "dir_acc": float(((P[nf, 2] > P[nf, 0]) == (y[nf] == 2)).mean()) if nf.any() else float("nan"),
+            "acc3": float((P.argmax(1) == y).mean()),
+            "logloss": float(-np.log(np.clip(P[np.arange(len(y)), y], 1e-6, 1)).mean())}
+
+
+def _sign_test_p(k, n):
+    from math import comb
+    return min(1.0, 2 * sum(comb(n, i) for i in range(0, min(k, n - k) + 1)) / 2 ** n) if n else 1.0
+
+
+def compare_methods():
+    """主比較：即時版(B) vs 同一時點的標準版(C)，兩者來自同一次執行，只差有沒有套用即時資料。
+    附帶：排程版(A)，僅在同一資料日有排程預測時才有。每個資料日只取最後一次即時執行。"""
+    out = {"n": 0, "pending": 0, "ready": False}
+    if not os.path.exists(LIVE_LOG):
+        return out
+    lv = pd.read_csv(LIVE_LOG, dtype=object)
+    out["pending"] = int(lv["actual"].isna().sum())
+    ok = lv.dropna(subset=["actual"]).copy()
+    if ok.empty:
+        return out
+    nruns = len(ok)
+    num = ["pl_down", "pl_flat", "pl_up", "ps_down", "ps_flat", "ps_up"]
+    ok[num] = ok[num].astype(float)  # 同一資料日若執行多次，機率取平均，以「資料日」為獨立單位
+    ok = ok.groupby("asof", as_index=False).agg({**{k_: "mean" for k_ in num}, "actual": "first"})
+    y = ok["actual"].map({"down": 0, "flat": 1, "up": 2}).to_numpy()
+    B = ok[["pl_down", "pl_flat", "pl_up"]].astype(float).to_numpy()
+    C = ok[["ps_down", "ps_flat", "ps_up"]].astype(float).to_numpy()
+    out.update(n=len(ok), runs=nruns, ready=len(ok) >= MIN_COMPARE_DAYS, B=_metrics(B, y), C=_metrics(C, y))
+    nf = y != 1
+    db, dc = B[:, 2] > B[:, 0], C[:, 2] > C[:, 0]
+    dis = nf & (db != dc)
+    bw = int((dis & (db == (y == 2))).sum())
+    out.update(disagree=int(dis.sum()), B_wins=bw, C_wins=int(dis.sum()) - bw,
+               p=_sign_test_p(bw, int(dis.sum())))
+    if os.path.exists("data/predictions.csv"):
+        sch = pd.read_csv("data/predictions.csv", dtype=object).dropna(subset=["actual"])
+        m = sch.merge(ok[["asof"]], on="asof")
+        if len(m):
+            ya = m["actual"].map({"down": 0, "flat": 1, "up": 2}).to_numpy()
+            out["A"] = _metrics(m[["p_down", "p_flat", "p_up"]].astype(float).to_numpy(), ya)
+    return out
+
+
+def compare_verdict(c_):
+    if c_["disagree"] < 5:
+        return "即時版與標準版的方向判斷分歧天數太少，無法用方向命中率分出優劣；可參考對數損失(越低代表機率越貼近實際)。"
+    if c_["p"] < 0.10:
+        better = "即時版" if c_["B_wins"] > c_["C_wins"] else "標準版"
+        return f"初步傾向「{better}」較佳（符號檢定 p={c_['p']:.2f}），但樣本仍小，建議累積更多天數再下結論。"
+    return f"差異在隨機波動範圍內（符號檢定 p={c_['p']:.2f}），目前無法判斷哪個方案較準。"
+
+
+_CMP_ROWS = (("B", "即時版（套用即時資料）"), ("C", "標準版（同一次執行，不含即時資料）"), ("A", "排程版（僅計同日有排程預測者）"))
+
+
+def compare_lines():
+    c_ = COMPARE
+    if not c_:
+        return []
+    L_ = ["", "## 方案比對：即時版 vs 標準版",
+          f"- 已累積可比對交易日：**{c_['n']}/{MIN_COMPARE_DAYS}**（共 {c_.get('runs', 0)} 次即時執行，同一天多次取機率平均；待驗證 {c_['pending']} 筆）"]
+    if not c_["ready"]:
+        return L_ + [f"- 滿 {MIN_COMPARE_DAYS} 個交易日後顯示初步比對。任何時間手動執行都會被記錄。"]
+    L_ += ["", "| 方案 | 天數 | 方向命中率 | 三分類命中率 | 平均對數損失(低=好) |", "|---|---|---|---|---|"]
+    for k, nm in _CMP_ROWS:
+        if k in c_:
+            m_ = c_[k]
+            L_.append(f"| {nm} | {m_['n']} | {m_['dir_acc']*100:.0f}% | {m_['acc3']*100:.0f}% | {m_['logloss']:.3f} |")
+    return L_ + [f"- 即時版與標準版方向判斷不同的天數：{c_['disagree']}（即時版對 {c_['B_wins']}／標準版對 {c_['C_wins']}）",
+                 f"- {compare_verdict(c_)}", "- 樣本很小，命中率本來就在 50% 附近，僅供初步參考。"]
+
+
+def compare_card():
+    c_ = COMPARE
+    if not c_:
+        return ""
+    pct = min(c_["n"] / MIN_COMPARE_DAYS, 1) * 100
+    h = ('<div class="card"><h2>方案比對：即時版 vs 標準版</h2>'
+         f'<div class="sub">已累積可比對交易日 <b>{c_["n"]}/{MIN_COMPARE_DAYS}</b>（共 {c_.get("runs", 0)} 次執行，同一天多次取平均；待驗證 {c_["pending"]} 筆）</div>'
+         f'<div class="bar" style="margin:8px 0"><span style="width:{pct:.0f}%;background:var(--up)"></span></div>')
+    if not c_["ready"]:
+        return h + f'<p class="note">滿 {MIN_COMPARE_DAYS} 個交易日後顯示初步比對。任何時間手動執行都會被記錄。</p></div>'
+    rows = "".join(
+        f'<tr><td>{nm}</td><td>{c_[k]["n"]}</td><td>{c_[k]["dir_acc"] * 100:.0f}%</td><td>{c_[k]["acc3"] * 100:.0f}%</td><td>{c_[k]["logloss"]:.3f}</td></tr>'
+        for k, nm in _CMP_ROWS if k in c_)
+    return (h + '<div class="tw"><table><tr><th>方案</th><th>天數</th><th>方向命中率</th><th>三分類命中率</th><th>平均對數損失（低=好）</th></tr>'
+            + rows + '</table></div>'
+            + f'<p class="note">方向判斷不同的天數：{c_["disagree"]}（即時版對 {c_["B_wins"]}／標準版對 {c_["C_wins"]}）。{_e(compare_verdict(c_))}'
+              '<br>標準版與即時版來自同一次執行，只差有沒有套用即時資料，所以能單獨看出即時資料的效果。樣本很小，僅供初步參考。</p></div>')
+
+
+# ----------------------------- 自上次執行以來的變化 -----------------------------
+SNAP_PATH = "data/last_run.json"
+DELTA = {}
+NEWS_LABEL = {"ukraine": "烏俄", "iran": "美伊", "uschina": "美中", "fed": "聯準會", "analyst": "外資評等",
+              "revenue": "營收法說", "demand": "產業需求", "g_tw": "Google TPU(中)", "g_en": "Google TPU(英)", "g_ai": "Alphabet AI"}
+_MODE_ZH = {"scheduled": "排程版", "live": "即時版"}
+
+
+def load_snapshot():
+    try:
+        with open(SNAP_PATH, encoding="utf-8") as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def build_snapshot(asof, p, F, run_ts):
+    return {"run_ts": run_ts, "mode": RUN["mode"], "asof": asof, "p": [float(x) for x in p],
+            "scores": {x[2]: x[4] for x in F if x[4] is not None},
+            "heads": {k: [t for _, t, _ in v] for k, v in NEWS_ITEMS.items()},
+            "quotes": {q["tk"]: q["move"] for q in LIVE_QUOTES}}
+
+
+def build_delta(prev, cur):
+    if not prev:
+        return {}
+    ch = sorted([(n, prev["scores"][n], v) for n, v in cur["scores"].items()
+                 if n in prev["scores"] and abs(v - prev["scores"][n]) >= 2], key=lambda x: -abs(x[2] - x[1]))[:6]
+    heads = []
+    for k, items in NEWS_ITEMS.items():
+        seen = set(prev.get("heads", {}).get(k, []))
+        heads += [(NEWS_LABEL.get(k, k), d, t, l) for d, t, l in items if t not in seen]
+    qs = [(q["name"], prev["quotes"][q["tk"]], q["move"]) for q in LIVE_QUOTES if q["tk"] in prev.get("quotes", {})]
+    return {"prev_ts": prev["run_ts"], "prev_mode": _MODE_ZH.get(prev.get("mode"), ""),
+            "same_asof": prev.get("asof") == cur["asof"], "p_prev": prev["p"], "p_cur": cur["p"],
+            "changes": ch, "new_heads": heads[:10], "quotes": qs}
+
+
+_NOTE_NEWS = "新聞不進預測模型，新聞本身不會改變上漲／下跌機率；機率的變化只來自股價、匯率、盤後價等市場資料。新聞請自行判讀。"
+
+
+def _pp(d):
+    pc_ = lambda x: f"{x * 100:.0f}%"
+    return (f"上漲 {pc_(d['p_prev'][2])}→{pc_(d['p_cur'][2])}（{(d['p_cur'][2] - d['p_prev'][2]) * 100:+.0f} 個百分點）／"
+            f"盤整 {pc_(d['p_prev'][1])}→{pc_(d['p_cur'][1])}／下跌 {pc_(d['p_prev'][0])}→{pc_(d['p_cur'][0])}"
+            + ("" if d["same_asof"] else "　※資料日已不同(新交易日)"))
+
+
+def delta_lines():
+    d = DELTA
+    if not d:
+        return []
+    L_ = ["", f"## 自上次執行以來的變化（{d['prev_mode']}，{d['prev_ts']}）", f"- 預測機率：{_pp(d)}"]
+    if d["changes"]:
+        L_.append("- 規則分數變動較大：" + "、".join(f"{n} {a:+d}→{b:+d}" for n, a, b in d["changes"]))
+    if d["quotes"]:
+        L_.append("- 即時行情漲跌：" + "、".join(f"{n} {a*100:+.2f}%→{b*100:+.2f}%" for n, a, b in d["quotes"]))
+    if d["new_heads"]:
+        L_.append("- 新出現的新聞標題：")
+        L_ += [f"  - [{lb}] {t}（{dd}）" for lb, dd, t, _ in d["new_heads"]]
+    return L_ + [f"- 註：{_NOTE_NEWS}"]
+
+
+def delta_card():
+    d = DELTA
+    if not d:
+        return ""
+    h = [f'<div class="card"><h2>自上次執行以來的變化</h2><div class="sub">對照：{_e(d["prev_mode"])}　{_e(d["prev_ts"])}</div>',
+         f'<div style="margin:8px 0">預測機率：{_e(_pp(d))}</div>']
+    if d["changes"]:
+        h.append('<div class="sub">規則分數變動較大</div>' + "".join(
+            f'<span class="chip {"s1" if b > a else "m1"}">{_e(n)} {a:+d}→{b:+d}</span>' for n, a, b in d["changes"]))
+    if d["quotes"]:
+        h.append('<div class="sub" style="margin-top:6px">即時行情漲跌：' + _e("、".join(
+            f"{n} {a*100:+.2f}%→{b*100:+.2f}%" for n, a, b in d["quotes"])) + "</div>")
+    if d["new_heads"]:
+        h.append('<div class="sub" style="margin-top:6px">新出現的新聞標題</div><ul style="padding-left:18px;margin:4px 0;line-height:1.9">'
+                 + "".join(f'<li><span class="bd">{_e(lb)}</span> <a href="{_e(l)}" target="_blank" rel="noopener">{_e(t)}</a> '
+                           f'<span class="sub">{_e(dd)}</span></li>' for lb, dd, t, l in d["new_heads"]) + "</ul>")
+    return "".join(h) + f'<p class="note">{_e(_NOTE_NEWS)}</p></div>'
 
 
 # ----------------------------- 實盤預測追蹤 -----------------------------
@@ -601,15 +822,23 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
             gl.append(f'<li><span class="bd">{lab}</span> <a href="{_e(l_)}" target="_blank" rel="noopener">{_e(t_)}</a> <span class="sub">{_e(d_)}</span></li>')
     gcard = ('<div class="card"><h2>Google / TPU 動態新聞</h2><ul style="padding-left:18px;margin:0;line-height:1.9">'
              + "".join(gl) + "</ul></div>") if gl else ""
+    ps_ = STD_PRED.get("p")
+    live_warn = ('<div class="warn">即時模式：預測值已套用最新盤後／盤中報酬（'
+                 + (_e("、".join(LIVE_ADJ)) if LIVE_ADJ else "目前無可套用的即時資料")
+                 + '），可能重複計入台股已反映的行情，僅供感受方向。'
+                 + (f'標準版（不含即時資料）：上漲 {ps_[2] * 100:.0f}% ／ 盤整 {ps_[1] * 100:.0f}% ／ 下跌 {ps_[0] * 100:.0f}%。' if ps_ is not None else "")
+                 + '排程版預測不受影響；本次結果不列入實盤命中率追蹤。</div>')
+    cmpcard = compare_card()
+    dcard = delta_card()
     lcard = ""
     if LIVE_QUOTES:
         lr_ = "".join(
             f'<tr><td>{_e(q["name"])} <span class="sub">{_e(q["tk"])}</span></td><td>{q["reg_close"]:.2f}</td>'
             f'<td>{q["last"]:.2f}</td><td class="{"up" if q["move"] >= 0 else "down"}">{q["move"] * 100:+.2f}%</td>'
             f'<td>{_e(q["session"])}</td><td class="sub">{q["ts"]:%m/%d %H:%M}</td></tr>' for q in LIVE_QUOTES)
-        lcard = ('<div class="card"><h2>即時行情（僅顯示，不影響預測模型）</h2><div class="tw"><table><tr><th>標的</th>'
+        lcard = ('<div class="card"><h2>即時行情（即時版預測已套用）</h2><div class="tw"><table><tr><th>標的</th>'
                  '<th>正規盤收盤</th><th>最新價</th><th>漲跌</th><th>時段</th><th>時間（台北）</th></tr>' + lr_
-                 + '</table></div><p class="note">資料來自 yfinance，可能延遲或缺漏；這些數字不會被餵進預測模型。</p></div>')
+                 + '</table></div><p class="note">資料來自 yfinance，可能延遲或缺漏；即時版的預測值已套用這些報酬，排程版不會。</p></div>')
     scard = ""
     if SCEN:
         t_ = lambda n, k: f'<div class="stat"><small>{n}</small><b class="{k}">{SCEN["px"][{"up": 2, "flat": 1, "down": 0}[k]]:.1f}</b><small>{SCEN["rets"][{"up": 2, "flat": 1, "down": 0}[k]] * 100:+.2f}%</small></div>'
@@ -624,7 +853,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
                  + ch(MODEL_DRIVERS["up"], "s1") + '<div class="sub" style="margin-top:6px">壓低上漲機率</div>'
                  + ch(MODEL_DRIVERS["down"], "m1")
                  + f'<p class="note">基準傾向（模型截距，反映訓練期上漲日與下跌日的比例）：{MODEL_DRIVERS.get("base", 0):+.2f}；各因子貢獻加上基準傾向 ＝ ln(上漲/下跌) ＝ {MODEL_DRIVERS.get("total", 0):+.2f}。與規則分數無關，兩者可能不一致。</p></div>')
-    banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else ('<div class="warn">即時模式：下方「即時行情」僅供顯示，預測模型與排程版採同一套規則、不受即時資料影響；本次結果不列入實盤命中率追蹤。</div>' if RUN["mode"] == "live" else "")
+    banner = '<div class="warn">⚠ 這是範例資料，僅供預覽版面，並非真實預測。</div>' if sample else (live_warn if RUN["mode"] == "live" else "")
     return f"""<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>聯發科 2454 每日預測</title><style>{CSS}</style></head><body><div class="wrap">
 <div class="top"><div><h1>聯發科 2454 · 每日預測儀表板</h1><div class="sub">資料日 {asof:%Y-%m-%d} ｜ 更新 {_e(now)}（台北）｜ 紅漲綠跌 ｜ {_e(RUN["label"])} ｜ <a href="index.html">排程版</a> · <a href="live.html">即時版</a></div></div>
@@ -633,7 +862,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
 <div class="card"><h2>模型多空傾向</h2><div class="big {cl}">{net_ * 10:+.1f}</div><div class="gauge"><u style="left:{(net_ * 10 + 10) / 20 * 100:.0f}%"></u></div>
 <div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div class="note" style="margin-top:8px">＝（上漲機率 − 下跌機率）×10，由預測模型直接算出。表格「規則分數」的均分為 {composite:+.1f}，是我訂的簡易規則，不是模型輸出，兩者不同很正常。</div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
 <div class="card"><h2>顯示分數最極端的因子（規則化評價，非模型）</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
-{lcard}{scard}{mcard}{gcard}{stats}
+{dcard}{lcard}{scard}{mcard}{gcard}{cmpcard}{stats}
 <div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>規則分數</th><th>模型貢獻</th><th>來源</th></tr>{"".join(rows)}</table></div>
 <p class="note">分數為 −10（偏空）到 +10（偏多）的規則化評價，綜合分依來源加權（Google 類 1.5、新聞 0.5、其餘 1.0）；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
 {hist}
@@ -729,7 +958,12 @@ def main():
     live = make_model().fit(data[feat_cols].tail(window), data["y"].tail(window))
     x_live = f[feat_cols].iloc[[-1]].fillna(0)
     x_live = x_live.clip(lower=data[feat_cols].quantile(0.005), upper=data[feat_cols].quantile(0.995), axis=1)
+    p_std = proba(live, x_live)[0]  # 標準版：不含即時資料(與排程版同規則)
+    if live_mode:  # 即時版：預測值改用最新盤後/盤中資料重算
+        x_live, adj_ = apply_live_quotes(x_live, LIVE_QUOTES, close, f, googl_reg, data, feat_cols)
+        LIVE_ADJ.extend(adj_)
     p = proba(live, x_live)[0]
+    STD_PRED["p"] = p_std
     names = ["下跌", "盤整", "上漲"]
     top = names[int(np.argmax(p))]
     conf = "低" if p.max() < 0.45 else "中" if p.max() < 0.60 else "高"
@@ -743,6 +977,8 @@ def main():
             used.update(fs_)
     FACTOR_CONTRIB["__other__"] = float(sum(v for k_, v in cb.items() if k_ not in used))
     live_stats = update_predictions(c, asof.strftime("%Y-%m-%d"), p, write=not live_mode)
+    update_live_log(c, asof.strftime("%Y-%m-%d"), p, p_std, dt.datetime.now(TZ_TW).strftime("%Y-%m-%d %H:%M"), write=live_mode)
+    COMPARE.update(compare_methods())
 
     # 新聞
     news = {}
@@ -845,7 +1081,7 @@ def main():
         clip_int(googl_reg / sd_g * 5) if sd_g else None, "模型")
     add("產業", "Google(GOOGL)盤後最新價",
         (f"收盤 {ah['reg_close']:.2f} → 最新 {ah['last']:.2f}（{pc(ah['move'])}，{ah['ts']:%m/%d %H:%M} 台北）"
-         + ("" if ah_fresh else "【已反映於台股今日走勢，未計入預測】") if ah else "n/a（盤後資料取得失敗）"),
+         + ("" if ah_fresh else "（即時版預測已套用）" if live_mode else "【已反映於台股今日走勢，未計入預測】") if ah else "n/a（盤後資料取得失敗）"),
         clip_int(ah["move"] / sd_g * 5) if ah_fresh and sd_g else None, "即時(yfinance)")
     nrow("產業", "Google TPU×聯發科新聞(中文)", "g_tw")
     nrow("產業", "Google TPU 國際新聞(英文)", "g_en")
@@ -863,6 +1099,10 @@ def main():
 
     sc_w = [(x[4], wt(x)) for x in F if x[4] is not None]
     composite = (sum(a * w for a, w in sc_w) / sum(w for _, w in sc_w)) if sc_w else 0.0
+    snap = build_snapshot(asof.strftime("%Y-%m-%d"), p, F, dt.datetime.now(TZ_TW).strftime("%Y-%m-%d %H:%M"))
+    DELTA.update(build_delta(load_snapshot(), snap))
+    with open(SNAP_PATH, "w", encoding="utf-8") as fh:
+        json.dump(snap, fh, ensure_ascii=False)
 
     # ---- 報告 ----
     now = dt.datetime.now(TZ_TW).strftime("%Y-%m-%d %H:%M")
@@ -884,10 +1124,16 @@ def main():
         da = "n/a" if live_stats["dir_acc"] is None else f"{live_stats['dir_acc']*100:.1f}%"
         L += ["", "## 實盤追蹤(本腳本每日預測 vs 實際)",
               f"- 已驗證 {live_stats['n']} 天；三分類命中 {live_stats['acc']*100:.1f}%；方向命中 {da}(n={live_stats['n_dir']})"]
+    L += delta_lines()
+    L += compare_lines()
     if LIVE_QUOTES:
-        L += ["", "## 即時行情(僅顯示，不影響模型)"] + [
+        L += ["", "## 即時行情(即時版預測已套用)"] + [
             f"- {q['name']}({q['tk']})：正規盤收 {q['reg_close']:.2f} → 最新 {q['last']:.2f}"
             f"（{pc(q['move'])}，{q['session']}，{q['ts']:%m/%d %H:%M} 台北）" for q in LIVE_QUOTES]
+    if LIVE_QUOTES and STD_PRED:
+        sp_ = STD_PRED["p"]
+        L += [f"- 已套用：{'、'.join(LIVE_ADJ) or '目前無可套用的即時資料'}",
+              f"- 標準版預測(不含即時資料)：上漲 {sp_[2]*100:.0f}% ／ 盤整 {sp_[1]*100:.0f}% ／ 下跌 {sp_[0]*100:.0f}%"]
     if SCEN:
         sn = SCEN
         L += ["", f"## 參考價位(情境，以目前價位 {sn['base']:.1f} 計)",
