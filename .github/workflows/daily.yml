@@ -2,8 +2,9 @@ name: mediatek-daily
 
 on:
   schedule:
-    # GitHub cron 使用 UTC：00:30 UTC = 台北 08:30，週一至週五
-    - cron: "30 0 * * 1-5"
+    # GitHub cron 使用 UTC：台北 08:07 與 08:37(備援)，週一至週五；避開整點與半點的尖峰
+    - cron: "7 0 * * 1-5"
+    - cron: "37 0 * * 1-5"
   workflow_dispatch:
     inputs:
       backfill:
