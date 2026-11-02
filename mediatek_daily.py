@@ -605,6 +605,40 @@ def compare_card():
               '<br>標準版與即時版來自同一次執行，只差有沒有套用即時資料，所以能單獨看出即時資料的效果。樣本很小，僅供初步參考。</p></div>')
 
 
+def wilson(k, n, z=1.96):
+    from math import sqrt
+    if not n:
+        return float("nan"), float("nan")
+    ph, d = k / n, 1 + z * z / n
+    c_, a_ = ph + z * z / (2 * n), z * sqrt(ph * (1 - ph) / n + z * z / (4 * n * n))
+    return (c_ - a_) / d, (c_ + a_) / d
+
+
+def hit_summary(path="data/predictions.csv"):
+    """實盤命中率摘要：只把『有明確方向』的判斷算進方向命中，並附 95% 信賴區間。"""
+    if not os.path.exists(path):
+        return ""
+    df = pd.read_csv(path, dtype=object).dropna(subset=["actual"])
+    if df.empty:
+        return "尚無已驗證的預測。"
+    k = m = hit3 = 0
+    for _, r in df.iterrows():
+        _, gap = lean_label(np.array([float(r["p_down"]), float(r["p_flat"]), float(r["p_up"])]))
+        hit3 += int(r["pred"] == r["actual"])
+        if abs(gap) >= .08 and r["actual"] != "flat":
+            m += 1
+            k += int((gap > 0) == (r["actual"] == "up"))
+    n = len(df)
+    s_ = f"已驗證 {n} 天；三分類命中 {hit3}/{n}（{hit3 / n:.0%}，純猜約 33%）。"
+    if m:
+        lo, hi = wilson(k, m)
+        s_ += (f"有明確方向（上漲與下跌機率差≥8 個百分點）且實際非盤整的判斷 {m} 次，命中 {k} 次"
+               f"（{k / m:.0%}，95% 信賴區間 {lo:.0%}–{hi:.0%}；純猜約 50%）。")
+    else:
+        s_ += "目前沒有符合條件的明確方向判斷。"
+    return s_ + "樣本少時區間很寬，無法據此判斷模型好壞；紀錄也混有不同版本的模型。"
+
+
 # ----------------------------- 自上次執行以來的變化 -----------------------------
 SNAP_PATH = "data/last_run.json"
 DELTA = {}
@@ -810,12 +844,15 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
         hr = []
         for _, r in h.iterrows():
             act = r["actual"] if isinstance(r["actual"], str) and r["actual"] else None
-            mk = "待驗證" if act is None else ("✓" if act == r["pred"] else "✗")
+            lab, gap = lean_label(np.array([float(r["p_down"]), float(r["p_flat"]), float(r["p_up"])]))
+            mk = ("待驗證" if act is None else "不計（方向不明）" if abs(gap) < .08 else "不計（實際盤整）" if act == "flat"
+                  else "✓" if (gap > 0) == (act == "up") else "✗")
             hr.append(f"<tr><td>{_e(r['asof'])}</td><td>{float(r['p_up']) * 100:.0f}% / {float(r['p_flat']) * 100:.0f}% / {float(r['p_down']) * 100:.0f}%</td>"
-                      f"<td>{_LBL.get(r['pred'], '')}</td><td>{_LBL.get(act, '—')}</td><td>{mk}</td></tr>")
+                      f"<td>{lab}</td><td>{_LBL.get(act, '—')}</td><td>{mk}</td></tr>")
         if hr:
-            hist = ('<div class="card"><h2>近期預測紀錄</h2><div class="tw"><table><tr><th>資料日</th><th>漲 / 盤 / 跌</th><th>預測</th><th>實際</th><th>結果</th></tr>'
-                    + "".join(hr) + "</table></div></div>")
+            hist = ('<div class="card"><h2>近期預測紀錄</h2><div class="tw"><table><tr><th>資料日</th><th>漲 / 盤 / 跌</th><th>模型判斷</th><th>實際</th><th>結果</th></tr>'
+                    + "".join(hr) + "</table></div>"
+                    + f'<p class="note">{_e(hit_summary(hist_path))}</p></div>')
     gl = []
     for key, lab in (("g_tw", "中文"), ("g_en", "國際"), ("g_ai", "AI晶片")):
         for d_, t_, l_ in NEWS_ITEMS.get(key, [])[:5]:
@@ -1124,6 +1161,8 @@ def main():
         da = "n/a" if live_stats["dir_acc"] is None else f"{live_stats['dir_acc']*100:.1f}%"
         L += ["", "## 實盤追蹤(本腳本每日預測 vs 實際)",
               f"- 已驗證 {live_stats['n']} 天；三分類命中 {live_stats['acc']*100:.1f}%；方向命中 {da}(n={live_stats['n_dir']})"]
+    if os.path.exists("data/predictions.csv"):
+        L += ["", "- " + hit_summary()]
     L += delta_lines()
     L += compare_lines()
     if LIVE_QUOTES:
