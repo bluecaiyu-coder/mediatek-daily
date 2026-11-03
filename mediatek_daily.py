@@ -11,7 +11,9 @@
 用法：python mediatek_daily.py [--backfill 250]
 """
 import argparse
+import difflib
 import json
+import re
 import datetime as dt
 import os
 import time
@@ -322,7 +324,7 @@ def news_score(query, lang="zh", days=2):
     heat = len(items)  # 新聞熱度：期間內相關報導則數
     pos, neg = (POS, NEG) if lang == "zh" else (POS_EN, NEG_EN)
     rows = []
-    for it in items[:30]:
+    for it in items:
         t = (it.findtext("title") or "").strip()
         try:
             d = parsedate_to_datetime(it.findtext("pubDate")).strftime("%m/%d")
@@ -331,9 +333,9 @@ def news_score(query, lang="zh", days=2):
         rows.append((d, t, (it.findtext("link") or "").strip()))
     if not rows:
         return None, [], 0, []
-    net = [sum(w in t.lower() for w in pos) - sum(w in t.lower() for w in neg) for _, t, _ in rows]
+    net = [sum(w in t.lower() for w in pos) - sum(w in t.lower() for w in neg) for _, t, _ in rows[:30]]
     amp = 0.5 + 0.5 * min(heat, 40) / 40  # 熱度越高，情緒分數放大越多
-    return clip_int(np.mean(net) * 6 * amp), [f"{t}（{d}）" for d, t, _ in rows[:3]], heat, rows[:8]
+    return clip_int(np.mean(net) * 6 * amp), [f"{t}（{d}）" for d, t, _ in rows[:3]], heat, rows
 
 
 # ----------------------------- 特徵工程 -----------------------------
@@ -639,6 +641,58 @@ def hit_summary(path="data/predictions.csv"):
     return s_ + "樣本少時區間很寬，無法據此判斷模型好壞；紀錄也混有不同版本的模型。"
 
 
+def cluster_news(items, thr=0.65):
+    """相似標題歸為同一事件(字元相似度，非語意判斷)。"""
+    cl = []
+    for d, t, l in items:
+        core, _, src = t.rpartition(" - ")
+        core, src = (core, src) if core else (t, "")
+        n = re.sub(r"[\W_]+", "", core.lower())
+        for c_ in cl:
+            if difflib.SequenceMatcher(None, n, c_["n"]).ratio() >= thr or (len(n) > 8 and (n in c_["n"] or c_["n"] in n)):
+                c_["items"].append((d, t, l))
+                c_["srcs"].add(src)
+                break
+        else:
+            cl.append({"title": core, "n": n, "srcs": {src}, "items": [(d, t, l)]})
+    return sorted(cl, key=lambda c_: -len(c_["items"]))
+
+
+def news_card():
+    rows = []
+    for k, lab in NEWS_LABEL.items():
+        its = NEWS_ITEMS.get(k) or []
+        if its:
+            rows.append(f"<tr><td>{_e(lab)}</td><td>{len(its)}</td><td>{len(cluster_news(its))}</td></tr>")
+    if not rows:
+        return ""
+    return ('<div class="card"><h2>新聞議題總覽</h2><div class="tw"><table><tr><th>議題</th><th>報導則數</th><th>歸併後事件數</th></tr>'
+            + "".join(rows) + '</table></div><p class="note">相似標題歸為同一事件，完整清單見 <a href="news.html">新聞總覽頁</a>。</p></div>')
+
+
+def render_news_html(now):
+    body = []
+    for k, lab in NEWS_LABEL.items():
+        its = NEWS_ITEMS.get(k) or []
+        cl = cluster_news(its)
+        lis = []
+        for c_ in cl:
+            d0, t0, l0 = c_["items"][0]
+            more = "".join(f'<li><a href="{_e(l)}" target="_blank" rel="noopener">{_e(t)}</a> <span class="sub">{_e(d)}</span></li>'
+                           for d, t, l in c_["items"][1:])
+            det = (f'<details><summary class="sub">另 {len(c_["items"]) - 1} 篇相似報導</summary><ul>{more}</ul></details>'
+                   if len(c_["items"]) > 1 else "")
+            lis.append(f'<li><a href="{_e(l0)}" target="_blank" rel="noopener">{_e(c_["title"])}</a> <span class="bd">×{len(c_["items"])}</span> '
+                       f'<span class="sub">{_e(d0)}｜{_e("、".join(sorted(x for x in c_["srcs"] if x)))}</span>{det}</li>')
+        body.append(f'<div class="card"><h2>{_e(lab)}　<span class="sub">{len(its)} 則報導 → {len(cl)} 個事件</span></h2>'
+                    + (f'<ul style="padding-left:18px;line-height:1.8">{"".join(lis)}</ul>' if lis else '<div class="sub">無資料</div>') + "</div>")
+    return (f'<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
+            f'<title>新聞總覽</title><style>{CSS}</style></head><body><div class="wrap"><div class="top"><div><h1>新聞總覽（依議題歸併）</h1>'
+            f'<div class="sub">更新 {_e(now)}（台北）｜ <a href="index.html">排程版</a> · <a href="live.html">即時版</a> · <a href="news.html">新聞總覽</a></div></div></div>'
+            f'<div class="warn">相似標題以字元相似度歸為同一事件，不是語意判斷，可能漏併或誤併。範圍：每個議題 Google News 近 2 日'
+            f'（Google／TPU 類近 7 日），單一關鍵字最多回傳約 100 則，超出者不會列出。</div>{"".join(body)}</div></body></html>')
+
+
 # ----------------------------- 自上次執行以來的變化 -----------------------------
 SNAP_PATH = "data/last_run.json"
 DELTA = {}
@@ -866,6 +920,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
                  + (f'標準版（不含即時資料）：上漲 {ps_[2] * 100:.0f}% ／ 盤整 {ps_[1] * 100:.0f}% ／ 下跌 {ps_[0] * 100:.0f}%。' if ps_ is not None else "")
                  + '排程版預測不受影響；本次結果不列入實盤命中率追蹤。</div>')
     cmpcard = compare_card()
+    ncard = news_card()
     dcard = delta_card()
     lcard = ""
     if LIVE_QUOTES:
@@ -899,7 +954,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
 <div class="card"><h2>模型多空傾向</h2><div class="big {cl}">{net_ * 10:+.1f}</div><div class="gauge"><u style="left:{(net_ * 10 + 10) / 20 * 100:.0f}%"></u></div>
 <div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div class="note" style="margin-top:8px">＝（上漲機率 − 下跌機率）×10，由預測模型直接算出。表格「規則分數」的均分為 {composite:+.1f}，是我訂的簡易規則，不是模型輸出，兩者不同很正常。</div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
 <div class="card"><h2>顯示分數最極端的因子（規則化評價，非模型）</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
-{dcard}{lcard}{scard}{mcard}{gcard}{cmpcard}{stats}
+{dcard}{lcard}{scard}{mcard}{ncard}{gcard}{cmpcard}{stats}
 <div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>規則分數</th><th>模型貢獻</th><th>來源</th></tr>{"".join(rows)}</table></div>
 <p class="note">分數為 −10（偏空）到 +10（偏多）的規則化評價，綜合分依來源加權（Google 類 1.5、新聞 0.5、其餘 1.0）；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
 {hist}
@@ -1207,6 +1262,8 @@ def main():
                            composite, F, bt, live_stats, window, note, now, "data/predictions.csv")
         with open("docs/live.html" if live_mode else "docs/index.html", "w", encoding="utf-8") as fh:
             fh.write(page)
+        with open("docs/news.html", "w", encoding="utf-8") as fh2:
+            fh2.write(render_news_html(now))
     except Exception:
         import traceback
         tb = traceback.format_exc()
