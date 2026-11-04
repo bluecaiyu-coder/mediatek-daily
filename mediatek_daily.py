@@ -501,8 +501,9 @@ def update_live_log(c, asof, p_live, p_std, run_ts, write):
     df = (pd.read_csv(LIVE_LOG, dtype=object) if os.path.exists(LIVE_LOG)
           else pd.DataFrame(columns=cols))
     nxt = c.pct_change().shift(-1)
+    recent = set(c.index[-10:])
     for i, row in df.iterrows():
-        if pd.isna(row["actual"]) or row["actual"] == "":
+        if pd.isna(row["actual"]) or row["actual"] == "" or pd.Timestamp(row["asof"]) in recent:
             d = pd.Timestamp(row["asof"])
             if d in nxt.index and pd.notna(nxt[d]):
                 df.at[i, "actual"] = cls(nxt[d])
@@ -782,8 +783,9 @@ def update_predictions(c, asof, p, write=True):
     df = (pd.read_csv(path, dtype=object) if os.path.exists(path)
           else pd.DataFrame(columns=cols))
     nxt = c.pct_change().shift(-1)
+    recent = set(c.index[-10:])
     for i, row in df.iterrows():
-        if pd.isna(row["actual"]) or row["actual"] == "":
+        if pd.isna(row["actual"]) or row["actual"] == "" or pd.Timestamp(row["asof"]) in recent:
             d = pd.Timestamp(row["asof"])
             if d in nxt.index and pd.notna(nxt[d]):
                 df.at[i, "actual"] = cls(nxt[d])
@@ -901,11 +903,20 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
             lab, gap = lean_label(np.array([float(r["p_down"]), float(r["p_flat"]), float(r["p_up"])]))
             mk = ("待驗證" if act is None else "不計（方向不明）" if abs(gap) < .08 else "不計（實際盤整）" if act == "flat"
                   else "✓" if (gap > 0) == (act == "up") else "✗")
-            hr.append(f"<tr><td>{_e(r['asof'])}</td><td>{float(r['p_up']) * 100:.0f}% / {float(r['p_flat']) * 100:.0f}% / {float(r['p_down']) * 100:.0f}%</td>"
-                      f"<td>{lab}</td><td>{_LBL.get(act, '—')}</td><td>{mk}</td></tr>")
+            cc_, d0, tgt, rt = CTX.get("c"), pd.Timestamp(r["asof"]), "—", ""
+            if cc_ is not None and d0 in cc_.index:
+                ix_ = cc_.index.get_loc(d0)
+                if ix_ + 1 < len(cc_):
+                    tgt = f"{cc_.index[ix_ + 1]:%m/%d}"
+                    rt = f"（{(cc_.iloc[ix_ + 1] / cc_.iloc[ix_] - 1) * 100:+.2f}%）"
+                else:
+                    tgt = f"{d0 + pd.offsets.BDay(1):%m/%d}（預計）"
+            hr.append(f"<tr><td>{_e(r['asof'])}</td><td>{tgt}</td><td>{float(r['p_up']) * 100:.0f}% / {float(r['p_flat']) * 100:.0f}% / {float(r['p_down']) * 100:.0f}%</td>"
+                      f"<td>{lab}</td><td>{_LBL.get(act, '—')}{rt}</td><td>{mk}</td></tr>")
         if hr:
-            hist = ('<div class="card"><h2>近期預測紀錄</h2><div class="tw"><table><tr><th>資料日</th><th>漲 / 盤 / 跌</th><th>模型判斷</th><th>實際</th><th>結果</th></tr>'
+            hist = ('<div class="card"><h2>近期預測紀錄</h2><div class="tw"><table><tr><th>資料日</th><th>預測對象日</th><th>漲 / 盤 / 跌</th><th>模型判斷</th><th>預測對象日的實際</th><th>結果</th></tr>'
                     + "".join(hr) + "</table></div>"
+                    + '<p class="note">資料日＝預測所用資料的最後一個交易日；預測對象日＝資料日的下一個交易日，「實際」是該日相對前一日收盤的漲跌。</p>'
                     + f'<p class="note">{_e(hit_summary(hist_path))}</p></div>')
     gl = []
     for key, lab in (("g_tw", "中文"), ("g_en", "國際"), ("g_ai", "AI晶片")):
@@ -961,6 +972,21 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
 <p class="note">每日台北 08:30 更新：美股為前一美股日完整收盤，Google 另附盤後最新價；盤後價無歷史資料，無法回測。本頁僅供參考，不構成投資建議。</p></div></body></html>"""
 
 
+CTX = {}
+
+
+def drop_partial_tw_bar(frames, now_tw):
+    """台股尚未收盤(13:35 前)時，今日 K 棒不完整：台股欄位的今日資料一律不採用。"""
+    if now_tw.time() >= dt.time(13, 35):
+        return False
+    today_ = pd.Timestamp(now_tw.date())
+    for df_ in frames:
+        cols_ = [k for k in TW if k in df_.columns]
+        if today_ in df_.index and cols_:
+            df_.loc[today_, cols_] = np.nan
+    return True
+
+
 # ----------------------------- 主程式 -----------------------------
 def main():
     ap = argparse.ArgumentParser()
@@ -975,7 +1001,9 @@ def main():
     os.makedirs("reports", exist_ok=True)
 
     close, high, low, vol = download()
+    drop_partial_tw_bar((close, high, low, vol), dt.datetime.now(TZ_TW))
     f, c = build_features(close, high, low, vol)
+    CTX["c"] = c
     asof = f.index[-1]
 
     # Google 盤後價：歷史無法回測，僅併入即時預測列(正規盤漲跌 × 盤後漲跌)
