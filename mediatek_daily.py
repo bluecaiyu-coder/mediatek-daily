@@ -694,6 +694,79 @@ def render_news_html(now):
             f'（Google／TPU 類近 7 日），單一關鍵字最多回傳約 100 則，超出者不會列出。</div>{"".join(body)}</div></body></html>')
 
 
+MTK_NEWS = {}
+_MTK_KW = ("聯發科", "發哥", "2454", "mediatek")
+
+
+def fetch_mtk_news_today(now_tw):
+    """即時版：列出台北時間『今日』發布、標題含聯發科的報導，相似標題歸併為同一事件。"""
+    from email.utils import parsedate_to_datetime
+    rows = []
+    for q, loc in (("聯發科 OR 2454", {"hl": "zh-TW", "gl": "TW", "ceid": "TW:zh-Hant"}),
+                   ("MediaTek", {"hl": "en-US", "gl": "US", "ceid": "US:en"})):
+        try:
+            r = requests.get("https://news.google.com/rss/search", params={"q": q + " when:2d", **loc}, headers=UA, timeout=30)
+            for it in ET.fromstring(r.content).findall(".//item"):
+                t = (it.findtext("title") or "").strip()
+                if not any(k in t.lower() for k in _MTK_KW):
+                    continue
+                try:
+                    ts = parsedate_to_datetime(it.findtext("pubDate")).astimezone(TZ_TW)
+                except Exception:
+                    continue
+                rows.append((ts, t, (it.findtext("link") or "").strip()))
+        except Exception as e:
+            print(f"[warn] 聯發科新聞 {q}: {e}")
+    seen_ = set()  # 同一則報導可能同時出現在中、英文搜尋結果，依連結去重
+    rows = [x for x in rows if not (x[2] in seen_ or seen_.add(x[2]))]
+    rows.sort(key=lambda x: x[0], reverse=True)
+    today = now_tw.date()
+    day = [x for x in rows if x[0].date() == today]
+    label = f"今日 {today:%m/%d}"
+    if not day:
+        day = [x for x in rows if x[0] >= now_tw - dt.timedelta(hours=24)]
+        label = "近 24 小時（今日尚無相符報導）"
+    items = [(f"{ts:%m/%d %H:%M}", t, l) for ts, t, l in day]
+    cl = cluster_news(items)
+    cl.sort(key=lambda c_: c_["items"][0][0], reverse=True)
+    return {"label": label, "clusters": cl, "total": len(items)}
+
+
+_MTK_NOTE = "僅即時版（手動更新）顯示，不進預測模型；來源 Google News，只列標題含聯發科／發哥／2454／MediaTek 者，可能漏列，請自行判讀。"
+
+
+def mtk_news_card():
+    n = MTK_NEWS
+    if not n:
+        return ""
+    lis = []
+    for c_ in n["clusters"]:
+        d0, t0, l0 = c_["items"][0]
+        more = "".join(f'<li><a href="{_e(l)}" target="_blank" rel="noopener">{_e(t)}</a> <span class="sub">{_e(d)}</span></li>'
+                       for d, t, l in c_["items"][1:])
+        det = (f'<details><summary class="sub">另 {len(c_["items"]) - 1} 篇相似報導</summary><ul>{more}</ul></details>'
+               if len(c_["items"]) > 1 else "")
+        lis.append(f'<li><span class="sub">{_e(d0)}</span> <a href="{_e(l0)}" target="_blank" rel="noopener">{_e(c_["title"])}</a> '
+                   f'<span class="bd">×{len(c_["items"])}</span> <span class="sub">{_e("、".join(sorted(x for x in c_["srcs"] if x)))}</span>{det}</li>')
+    body = (f'<ul style="padding-left:18px;line-height:1.8">{"".join(lis)}</ul>' if lis else '<div class="sub">目前沒有相符的報導</div>')
+    return (f'<div class="card"><h2>聯發科新聞：{_e(n["label"])}　<span class="sub">{n["total"]} 則報導 → {len(n["clusters"])} 個事件</span></h2>'
+            f'{body}<p class="note">{_e(_MTK_NOTE)}</p></div>')
+
+
+def mtk_news_lines():
+    n = MTK_NEWS
+    if not n:
+        return []
+    L_ = ["", f"## 聯發科新聞：{n['label']}（{n['total']} 則報導 → {len(n['clusters'])} 個事件）"]
+    for c_ in n["clusters"]:
+        d0, t0, l0 = c_["items"][0]
+        srcs = "、".join(sorted(x for x in c_["srcs"] if x))
+        L_.append(f"- {d0} {c_['title']}" + (f"（×{len(c_['items'])}：{srcs}）" if len(c_["items"]) > 1 else f"（{srcs}）") + f" {l0}")
+    if not n["clusters"]:
+        L_.append("- 目前沒有相符的報導")
+    return L_ + [f"- 註：{_MTK_NOTE}"]
+
+
 # ----------------------------- 自上次執行以來的變化 -----------------------------
 SNAP_PATH = "data/last_run.json"
 DELTA = {}
@@ -931,6 +1004,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
                  + (f'標準版（不含即時資料）：上漲 {ps_[2] * 100:.0f}% ／ 盤整 {ps_[1] * 100:.0f}% ／ 下跌 {ps_[0] * 100:.0f}%。' if ps_ is not None else "")
                  + '排程版預測不受影響；本次結果不列入實盤命中率追蹤。</div>')
     cmpcard = compare_card()
+    mtkcard = mtk_news_card()
     ncard = news_card()
     dcard = delta_card()
     lcard = ""
@@ -965,7 +1039,7 @@ def render_html(asof, px, chg1, spark, p, top, conf, composite, F, bt, live, win
 <div class="card"><h2>模型多空傾向</h2><div class="big {cl}">{net_ * 10:+.1f}</div><div class="gauge"><u style="left:{(net_ * 10 + 10) / 20 * 100:.0f}%"></u></div>
 <div class="sub" style="display:flex;justify-content:space-between"><span>−10 偏空</span><span>+10 偏多</span></div><div class="note" style="margin-top:8px">＝（上漲機率 − 下跌機率）×10，由預測模型直接算出。表格「規則分數」的均分為 {composite:+.1f}，是我訂的簡易規則，不是模型輸出，兩者不同很正常。</div><div style="margin-top:10px">{spark_svg}<div class="sub">近 60 日收盤</div></div></div></div>
 <div class="card"><h2>顯示分數最極端的因子（規則化評價，非模型）</h2><div class="sub">偏多</div>{chips(pos, "s1")}<div class="sub" style="margin-top:6px">偏空</div>{chips(neg, "m1")}</div>
-{dcard}{lcard}{scard}{mcard}{ncard}{gcard}{cmpcard}{stats}
+{dcard}{mtkcard}{lcard}{scard}{mcard}{ncard}{gcard}{cmpcard}{stats}
 <div class="card"><h2>{len(F)} 項因子明細</h2><div class="tw"><table><tr><th>#</th><th>因子</th><th>最新值</th><th>規則分數</th><th>模型貢獻</th><th>來源</th></tr>{"".join(rows)}</table></div>
 <p class="note">分數為 −10（偏空）到 +10（偏多）的規則化評價，綜合分依來源加權（Google 類 1.5、新聞 0.5、其餘 1.0）；「新聞關鍵字」僅對標題做正負詞計數，無歷史可回測，不進模型。{_e(note)}</p></div>
 {hist}
@@ -1110,6 +1184,12 @@ def main():
             news[k] = (None, [], 0, [])
         NEWS_ITEMS[k] = news[k][3]
 
+    if live_mode:  # 即時版：列出今日聯發科新聞(僅顯示)
+        try:
+            MTK_NEWS.update(fetch_mtk_news_today(dt.datetime.now(TZ_TW)))
+        except Exception as e:
+            print(f"[warn] 今日聯發科新聞失敗: {e}")
+
     # nq 夜盤期貨
     nq_ret = close["nq"].dropna().pct_change()
 
@@ -1246,6 +1326,7 @@ def main():
               f"- 已驗證 {live_stats['n']} 天；三分類命中 {live_stats['acc']*100:.1f}%；方向命中 {da}(n={live_stats['n_dir']})"]
     if os.path.exists("data/predictions.csv"):
         L += ["", "- " + hit_summary()]
+    L += mtk_news_lines()
     L += delta_lines()
     L += compare_lines()
     if LIVE_QUOTES:
